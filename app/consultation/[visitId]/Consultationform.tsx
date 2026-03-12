@@ -295,7 +295,7 @@ export function ConsultationForm({ visitId, department, patientName, patientAge,
               // Merge translations for all languages
               const merged = {
                 text:    state.accText,
-                english: role === "en-IN" ? state.accText : state.accTranslated,
+                english: fromLang === "en-IN" ? state.accText : state.accTranslated,
                 hindi:   result.hindi   || state.accTranslated,
                 kannada: result.kannada || state.accText,
               }
