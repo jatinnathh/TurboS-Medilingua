@@ -33,7 +33,6 @@ function SpotlightCard({ icon, title, desc }: { icon: string; title: string; des
     <div
       ref={ref}
       onMouseMove={handleMouseMove}
-      onMouseLeave={() => setPos(p => ({ ...p, visible: false }))}
       style={{
         background: "var(--bg-card)",
         border: "1px solid var(--border)",
