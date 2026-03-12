@@ -1,0 +1,3702 @@
+﻿full 
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\api\auth\[...nextauth]\route.ts =====
+import NextAuth, { NextAuthOptions } from "next-auth"
+import CredentialsProvider from "next-auth/providers/credentials"
+import { prisma } from "@/lib/prisma"
+import bcrypt from "bcrypt"
+
+export const authOptions: NextAuthOptions = {
+
+  providers: [
+    CredentialsProvider({
+      name: "Credentials",
+      credentials: {
+        email: {},
+        password: {}
+      },
+
+      async authorize(credentials) {
+
+        if (!credentials?.email || !credentials?.password) {
+          return null
+        }
+
+        const user = await prisma.user.findUnique({
+          where: { email: credentials.email }
+        })
+
+        if (!user) return null
+
+        const isValid = await bcrypt.compare(
+          credentials.password,
+          user.password
+        )
+
+        if (!isValid) return null
+
+        return {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          role: user.role
+        }
+      }
+
+    })
+  ],
+
+  session: {
+    strategy: "jwt"
+  },
+
+  callbacks: {
+
+    async jwt({ token, user }) {
+
+      if (user) {
+        token.role = user.role
+        token.id = user.id
+      }
+
+      return token
+    },
+
+    async session({ session, token }) {
+
+      if (session.user) {
+        session.user.id = token.id as string
+        session.user.role = token.role as string
+      }
+
+      return session
+    }
+
+  }
+
+}
+
+const handler = NextAuth(authOptions)
+
+export { handler as GET, handler as POST }
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\api\consultation\[visitId]\save\route.ts =====
+// app/api/consultation/[visitId]/save/route.ts
+// Saves the full conversation + generated report to the Visit record
+
+import { NextRequest, NextResponse } from "next/server"
+import { prisma } from "@/lib/prisma"
+
+export async function POST(
+  req: NextRequest,
+  { params }: { params: Promise<{ visitId: string }> }
+) {
+  try {
+    const { visitId } = await params
+    const { messages, report, language } = await req.json()
+
+    if (!visitId) {
+      return NextResponse.json({ error: "Missing visitId" }, { status: 400 })
+    }
+
+    // Build plain text transcript from messages
+    const transcript = (messages ?? [])
+      .map((m: { role: string; text: string; translated?: string; timestamp: string }) => {
+        const speaker = m.role === "patient" ? "Patient" : "Doctor"
+        const text    = m.translated ?? m.text
+        return `[${m.timestamp}] ${speaker}: ${text}`
+      })
+      .join("\n")
+
+    const updated = await prisma.visit.update({
+      where: { id: visitId },
+      data: {
+        transcript,
+        report,
+        language,
+        messages,  // store full structured messages array
+      },
+    })
+
+    return NextResponse.json({ success: true, visitId: updated.id })
+
+  } catch (err) {
+    console.error("Save consultation error:", err)
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 })
+  }
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\api\patient\route.ts =====
+import { prisma } from "@/lib/prisma"
+
+export async function POST(req: Request){
+
+  const body = await req.json()
+
+  const patient = await prisma.patient.create({
+    data:{
+      name: body.name,
+      age: body.age,
+      gender: body.gender,
+      phone: body.phone,
+    }
+  })
+
+  const visit = await prisma.visit.create({
+    data:{
+      patientId: patient.id,
+      department: body.department
+    }
+  })
+
+  return Response.json({patient,visit})
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\api\sarvam\report\route.ts =====
+// app/api/sarvam/report/route.ts
+//
+// PIPELINE:
+//   1. Build English transcript from messages
+//   2. Send to HuggingFace d4data/biomedical-ner-all (medical NER)
+//   3. Map NER entity labels â†’ report fields
+//   4. Fill any gaps with light rule-based patterns
+//   5. Return structured MedicalReport JSON
+//
+// NER model: d4data/biomedical-ner-all
+//   Trained on BC5CDR + NCBI + JNLPBA + i2b2 corpora
+//   Entity types: Disease, Drug, Dosage, Symptom, Body_Part,
+//                 Lab_value, Medical_procedure, Sign_symptom, etc.
+//
+// Env vars needed:
+//   HUGGINGFACE_API_KEY â€” free tier works fine for inference
+
+import { NextRequest, NextResponse } from "next/server"
+
+const HF_KEY   = process.env.HUGGINGFACE_API_KEY!
+const NER_URL  = "https://api-inference.huggingface.co/models/d4data/biomedical-ner-all"
+
+/* â”€â”€â”€ Types â”€â”€â”€ */
+interface Message {
+  role:       "patient" | "doctor"
+  text:       string
+  english?:   string
+  translated?: string
+  timestamp:  string
+}
+
+interface NEREntity {
+  entity_group: string   // e.g. "Disease_disorder", "Medication", "Sign_symptom"
+  word:         string
+  score:        number
+  start:        number
+  end:          number
+}
+
+interface MedicalReport {
+  chiefComplaint:           string
+  historyOfPresentIllness:  string
+  symptoms:                 string[]
+  examFindings:             string
+  diagnosis:                string
+  treatment:                string[]
+  medications:              string[]
+  investigations:           string[]
+  followUp:                 string
+  additionalNotes:          string
+}
+
+/* â”€â”€â”€ NER entity label â†’ report field mapping â”€â”€â”€ */
+// d4data/biomedical-ner-all label set:
+const LABEL_MAP: Record<string, keyof MedicalReport | null> = {
+  // Symptoms / complaints
+  "Sign_symptom":         "symptoms",
+  "Symptom":              "symptoms",
+  "Sign":                 "symptoms",
+
+  // Diagnosis / disease
+  "Disease_disorder":     "diagnosis",
+  "Disease":              "diagnosis",
+  "Disorder":             "diagnosis",
+  "Pathology":            "diagnosis",
+
+  // Medications / drugs
+  "Medication":           "medications",
+  "Drug":                 "medications",
+  "Medicine":             "medications",
+  "Therapeutic_procedure":"treatment",
+
+  // Investigations / labs
+  "Lab_value":            "investigations",
+  "Laboratory_procedure": "investigations",
+  "Diagnostic_procedure": "investigations",
+  "Diagnostic_imaging":   "investigations",
+
+  // Anatomy â€” used for exam findings
+  "Body_part":            "examFindings",
+  "Anatomy":              "examFindings",
+
+  // Dosage / frequency â€” appended to medications
+  "Dosage":               null,   // handled separately
+  "Frequency":            null,   // handled separately
+  "Duration":             null,   // handled separately
+
+  // Misc clinical
+  "Clinical_event":       "additionalNotes",
+  "Biological_structure": "examFindings",
+}
+
+/* â”€â”€â”€ Deduplicate array, normalize casing â”€â”€â”€ */
+function dedup(arr: string[]): string[] {
+  const seen = new Set<string>()
+  return arr
+    .map(s => s.trim().replace(/\s+/g, " "))
+    .filter(s => s.length > 1)
+    .filter(s => { const k = s.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true })
+}
+
+/* â”€â”€â”€ Merge dosage/frequency tokens with adjacent medication tokens â”€â”€â”€ */
+function mergeMedications(entities: NEREntity[], fullText: string): string[] {
+  const meds: string[] = []
+
+  entities.forEach((ent, idx) => {
+    const label = ent.entity_group
+    if (!["Medication","Drug","Medicine"].includes(label)) return
+
+    let medStr = ent.word
+    // Look ahead up to 3 tokens for dosage / frequency
+    for (let j = idx + 1; j <= idx + 3 && j < entities.length; j++) {
+      const next = entities[j]
+      if (["Dosage","Frequency","Duration"].includes(next.entity_group)) {
+        // Only merge if tokens are close in source text (within 30 chars)
+        if (Math.abs(next.start - ent.end) < 30) {
+          medStr += ` ${next.word}`
+        }
+      }
+    }
+    meds.push(medStr)
+  })
+
+  return dedup(meds)
+}
+
+/* â”€â”€â”€ Call HuggingFace NER inference â”€â”€â”€ */
+async function runNER(text: string): Promise<NEREntity[]> {
+  // Chunk text if > 512 tokens (model limit) â€” ~400 words per chunk
+  const words  = text.split(" ")
+  const chunks: string[] = []
+  for (let i = 0; i < words.length; i += 380) {
+    chunks.push(words.slice(i, i + 380).join(" "))
+  }
+
+  const allEntities: NEREntity[] = []
+  let   offset = 0
+
+  for (const chunk of chunks) {
+    const res = await fetch(NER_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${HF_KEY}`,
+        "Content-Type":  "application/json",
+      },
+      body: JSON.stringify({
+        inputs: chunk,
+        parameters: { aggregation_strategy: "simple" },
+        options:    { wait_for_model: true },
+      }),
+    })
+
+    if (!res.ok) {
+      const err = await res.text()
+      console.warn(`NER chunk failed (offset ${offset}):`, err)
+      // Continue with other chunks
+    } else {
+      const entities: NEREntity[] = await res.json()
+      // Adjust char offsets for chunking
+      entities.forEach(e => {
+        e.start += offset
+        e.end   += offset
+      })
+      allEntities.push(...entities)
+    }
+
+    offset += chunk.length + 1
+  }
+
+  return allEntities
+}
+
+/* â”€â”€â”€ Rule-based patterns for fields NER misses â”€â”€â”€ */
+function extractFollowUp(doctorLines: string[]): string {
+  const patterns = [
+    /come\s+back\s+in\s+[\w\s]+/i,
+    /follow[\s-]?up\s+in\s+[\w\s]+/i,
+    /review\s+after\s+[\w\s]+/i,
+    /return\s+if\s+.+/i,
+    /visit\s+again\s+.+/i,
+  ]
+  for (const line of doctorLines) {
+    for (const pat of patterns) {
+      const m = line.match(pat)
+      if (m) return m[0]
+    }
+  }
+  // Fallback: any doctor line mentioning follow/return/review
+  return doctorLines.find(l =>
+    /follow|return|review|appointment|revisit/i.test(l)
+  ) ?? "As needed"
+}
+
+function extractChiefComplaint(patientLines: string[]): string {
+  // First patient message is almost always the presenting complaint
+  const first = patientLines[0] ?? ""
+  // Try to trim to first sentence
+  const sentence = first.match(/[^.!?]+[.!?]?/)?.[0] ?? first
+  return sentence.trim().slice(0, 200) || "Not documented"
+}
+
+function extractExamFindings(doctorLines: string[], bodyParts: string[]): string {
+  // Combine body part NER hits with doctor lines mentioning examination
+  const examLines = doctorLines.filter(l =>
+    /exam|finding|tender|swollen|normal|clear|auscult|palpat|inspect|vital|bp|pulse|temp|spo2/i.test(l)
+  )
+  const parts = bodyParts.length ? `Involved areas: ${dedup(bodyParts).join(", ")}. ` : ""
+  return parts + (examLines[0] ?? "Not documented")
+}
+
+/* â•â•â•â•â•â•â•â•â•â• MAIN HANDLER â•â•â•â•â•â•â•â•â•â• */
+export async function POST(req: NextRequest) {
+  try {
+    const { messages, patientName, patientAge, patientGender, department } = await req.json()
+
+    if (!messages?.length) {
+      return NextResponse.json({ error: "No messages provided" }, { status: 400 })
+    }
+
+    /* Step 1 â€” Build English transcript */
+    const patientLines: string[] = []
+    const doctorLines:  string[] = []
+
+    ;(messages as Message[]).forEach(m => {
+      const text = m.english ?? m.translated ?? m.text
+      if (m.role === "patient") patientLines.push(text)
+      else                      doctorLines.push(text)
+    })
+
+    const fullTranscript = (messages as Message[])
+      .map(m => {
+        const speaker = m.role === "patient" ? "Patient" : "Doctor"
+        const text    = m.english ?? m.translated ?? m.text
+        return `${speaker}: ${text}`
+      })
+      .join("\n")
+
+    /* Step 2 â€” Run NER */
+    let entities: NEREntity[] = []
+    try {
+      entities = await runNER(fullTranscript)
+    } catch (nerErr) {
+      console.error("NER failed, using rule-based fallback:", nerErr)
+    }
+
+    /* Step 3 â€” Bucket entities by report field */
+    const buckets: Record<string, string[]> = {
+      symptoms:       [],
+      diagnosis:      [],
+      medications:    [],
+      investigations: [],
+      examFindings:   [],
+      treatment:      [],
+      additionalNotes:[],
+      bodyParts:      [],  // internal â€” merged into examFindings
+      dosage:         [],  // internal â€” merged with medications
+    }
+
+    entities.forEach(ent => {
+      if (ent.score < 0.50) return   // low-confidence filter
+
+      const label  = ent.entity_group
+      const word   = ent.word.replace(/^##/, "").trim()
+      const field  = LABEL_MAP[label]
+
+      if (label === "Body_part" || label === "Anatomy" || label === "Biological_structure") {
+        buckets.bodyParts.push(word)
+        return
+      }
+      if (field && buckets[field]) {
+        buckets[field].push(word)
+      }
+    })
+
+    /* Step 4 â€” Merge medications with dosage/frequency */
+    const mergedMeds = mergeMedications(entities, fullTranscript)
+    if (mergedMeds.length) buckets.medications = mergedMeds
+
+    /* Step 5 â€” Fill fields NER struggles with using rules */
+    const chiefComplaint   = extractChiefComplaint(patientLines)
+    const followUp         = extractFollowUp(doctorLines)
+    const examFindings     = extractExamFindings(doctorLines, buckets.bodyParts)
+
+    // History = all patient lines joined, trimmed
+    const history = patientLines.join(" ").trim().slice(0, 600) || "Not documented"
+
+    /* Step 6 â€” Assemble report */
+    const report: MedicalReport = {
+      chiefComplaint,
+      historyOfPresentIllness: history,
+      symptoms:       dedup(buckets.symptoms).length
+                        ? dedup(buckets.symptoms)
+                        : fallbackSymptoms(fullTranscript),
+      examFindings,
+      diagnosis:      dedup(buckets.diagnosis).join("; ") || fallbackDiagnosis(doctorLines),
+      treatment:      dedup(buckets.treatment).length
+                        ? dedup(buckets.treatment)
+                        : fallbackTreatment(doctorLines),
+      medications:    dedup(buckets.medications).length
+                        ? dedup(buckets.medications)
+                        : fallbackMedications(doctorLines),
+      investigations: dedup(buckets.investigations).length
+                        ? dedup(buckets.investigations)
+                        : fallbackInvestigations(fullTranscript),
+      followUp,
+      additionalNotes: dedup(buckets.additionalNotes).join(". ")
+                         || `${department?.replace(/_/g," ")} consultation â€” ${patientName}, ${patientAge}y${patientGender ? `, ${patientGender}` : ""}`,
+    }
+
+    return NextResponse.json({
+      report,
+      source: entities.length ? "ner" : "rule-based",
+      entityCount: entities.length,
+    })
+
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Unknown error"
+    console.error("Report route error:", msg)
+    return NextResponse.json({ error: msg }, { status: 500 })
+  }
+}
+
+/* â”€â”€â”€ Keyword fallbacks for when NER finds nothing â”€â”€â”€ */
+function fallbackSymptoms(text: string): string[] {
+  const keywords = [
+    "pain","fever","cough","cold","vomiting","nausea","headache","dizziness",
+    "fatigue","weakness","swelling","rash","itching","breathlessness",
+    "chest pain","stomach ache","back pain","sore throat","runny nose",
+    "loose stools","diarrhoea","constipation","loss of appetite","insomnia",
+  ]
+  return keywords.filter(k => text.toLowerCase().includes(k))
+}
+
+function fallbackDiagnosis(doctorLines: string[]): string {
+  const line = doctorLines.find(l =>
+    /diagnos|condition|impression|suffer|you have|it is|this is|presents with/i.test(l)
+  )
+  return line?.slice(0, 150) ?? "Pending evaluation"
+}
+
+function fallbackTreatment(doctorLines: string[]): string[] {
+  return doctorLines
+    .filter(l => /take|rest|avoid|drink|eat|apply|use|stop|start|continue|increase|decrease/i.test(l))
+    .slice(0, 4)
+}
+
+function fallbackMedications(doctorLines: string[]): string[] {
+  return doctorLines
+    .filter(l => /tablet|syrup|capsule|mg|ml|injection|drops|cream|ointment|paracetamol|amoxicillin|ibuprofen|cetirizine|omeprazole|azithromycin|metformin/i.test(l))
+    .slice(0, 5)
+}
+
+function fallbackInvestigations(text: string): string[] {
+  const tests = [
+    "blood test","cbc","complete blood count","urine test","urine culture",
+    "x-ray","xray","mri","ct scan","ultrasound","ecg","echo",
+    "biopsy","culture","hba1c","thyroid","lipid profile","liver function",
+    "kidney function","rbs","fbs","ppbs",
+  ]
+  return tests.filter(t => text.toLowerCase().includes(t))
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\api\sarvam\transcribe\route.ts =====
+// app/api/sarvam/transcribe/route.ts
+// Receives audio + speaker language
+// Returns transcript in original language + Hindi + English + Kannada
+
+import { NextRequest, NextResponse } from "next/server"
+
+const KEY = process.env.SARVAM_API_KEY!
+
+async function sttSarvam(audioBase64: string, languageCode: string): Promise<string> {
+  const audioBuffer = Buffer.from(audioBase64, "base64")
+  const audioBlob   = new Blob([audioBuffer], { type: "audio/wav" })
+  const formData    = new FormData()
+  formData.append("file", audioBlob, "audio.wav")
+  formData.append("language_code", languageCode)
+  formData.append("model", "saarika:v2.5")
+  formData.append("with_timestamps", "false")
+
+  const res = await fetch("https://api.sarvam.ai/speech-to-text", {
+    method: "POST",
+    headers: { "api-subscription-key": KEY },
+    body: formData,
+  })
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(`Sarvam STT failed: ${err}`)
+  }
+  const data = await res.json()
+  return data.transcript ?? ""
+}
+
+async function translateSarvam(text: string, source: string, target: string): Promise<string> {
+  if (source === target || !text.trim()) return text
+  const res = await fetch("https://api.sarvam.ai/translate", {
+    method: "POST",
+    headers: { "api-subscription-key": KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      input: text,
+      source_language_code: source,
+      target_language_code: target,
+      speaker_gender: "Male",
+      mode: "formal",
+      model: "mayura:v1",
+      enable_preprocessing: false,
+    }),
+  })
+  if (!res.ok) return text
+  const data = await res.json()
+  return data.translated_text ?? text
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const { audioBase64, languageCode } = await req.json()
+
+    if (!audioBase64 || !languageCode) {
+      return NextResponse.json({ error: "Missing audioBase64 or languageCode" }, { status: 400 })
+    }
+
+    // Step 1: Transcribe in original language
+    const originalText = await sttSarvam(audioBase64, languageCode)
+
+    if (!originalText.trim()) {
+      return NextResponse.json({ original: "", hindi: "", english: "", kannada: "", languageCode })
+    }
+
+    // Step 2: Translate to all 3 languages in parallel
+    const [hindi, english, kannada] = await Promise.all([
+      translateSarvam(originalText, languageCode, "hi-IN"),
+      translateSarvam(originalText, languageCode, "en-IN"),
+      translateSarvam(originalText, languageCode, "kn-IN"),
+    ])
+
+    return NextResponse.json({
+      original:     originalText,
+      hindi,
+      english,
+      kannada,
+      languageCode,
+    })
+
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Unknown error"
+    console.error("Transcribe route error:", message)
+    return NextResponse.json({ error: message }, { status: 500 })
+  }
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\api\sarvam\translate\route.ts =====
+// app/api/sarvam/translate/route.ts
+// Translates Kannada or Hindi text â†’ English
+// Uses Sarvam AI Translate API
+// Returns { translatedText: string }
+
+import { NextRequest, NextResponse } from "next/server"
+
+const SARVAM_API_KEY    = process.env.SARVAM_API_KEY!
+const SARVAM_TRANSLATE  = "https://api.sarvam.ai/translate"
+
+export async function POST(req: NextRequest) {
+  try {
+    const { text, sourceLanguage } = await req.json()
+    // sourceLanguage: "kn-IN" | "hi-IN" (English doesn't need translation)
+
+    if (!text || !sourceLanguage) {
+      return NextResponse.json({ error: "Missing text or sourceLanguage" }, { status: 400 })
+    }
+
+    // If already English, skip translation
+    if (sourceLanguage === "en-IN") {
+      return NextResponse.json({ translatedText: text })
+    }
+
+    const response = await fetch(SARVAM_TRANSLATE, {
+      method: "POST",
+      headers: {
+        "api-subscription-key": SARVAM_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        input:            text,
+        source_language_code: sourceLanguage,  // "kn-IN" | "hi-IN"
+        target_language_code: "en-IN",
+        speaker_gender:   "Male",
+        mode:             "formal",
+        model:            "mayura:v1",
+        enable_preprocessing: false,
+      }),
+    })
+
+    if (!response.ok) {
+      const err = await response.text()
+      console.error("Sarvam translate error:", err)
+      return NextResponse.json({ error: "Sarvam translate failed", details: err }, { status: 500 })
+    }
+
+    const data = await response.json()
+    return NextResponse.json({ translatedText: data.translated_text ?? text })
+
+  } catch (err) {
+    console.error("Translate route error:", err)
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 })
+  }
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\api\sarvam\tts\route.ts =====
+// app/api/sarvam/tts/route.ts
+// Receives text (ALREADY in targetLanguage) + targetLanguage code
+// Calls Sarvam bulbul:v2 TTS
+// Returns { audioBase64: string }
+//
+// IMPORTANT: The caller must pass text already in the target language.
+// This route does NOT translate. Translation already happened in transcribe/route.ts.
+
+import { NextRequest, NextResponse } from "next/server"
+
+const KEY = process.env.SARVAM_API_KEY!
+
+// Valid Sarvam bulbul:v2 speakers per language
+// Ref: https://docs.sarvam.ai/api-reference-docs/text-to-speech
+const SPEAKERS: Record<string, string> = {
+  "hi-IN": "anushka",
+  "kn-IN": "anushka",
+  "en-IN": "anushka",
+  "ta-IN": "anushka",
+  "te-IN": "anushka"
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json()
+    const { text, targetLanguage } = body as { text: string; targetLanguage: string }
+
+    if (!text?.trim()) {
+      return NextResponse.json({ error: "Missing text" }, { status: 400 })
+    }
+    if (!targetLanguage) {
+      return NextResponse.json({ error: "Missing targetLanguage" }, { status: 400 })
+    }
+
+    const speaker = SPEAKERS[targetLanguage] ?? "anushka"
+
+    // Log what we're sending for debugging
+    console.log(`[TTS] lang=${targetLanguage} speaker=${speaker} text="${text.slice(0,60)}â€¦"`)
+
+    const ttsRes = await fetch("https://api.sarvam.ai/text-to-speech", {
+      method: "POST",
+      headers: {
+        "api-subscription-key": KEY,
+        "Content-Type":         "application/json",
+      },
+      body: JSON.stringify({
+        inputs:               [text],
+        target_language_code: targetLanguage,
+        speaker:              speaker,
+        pitch:                0,
+        pace:                 1.0,
+        loudness:             1.5,
+        speech_sample_rate:   22050,
+        enable_preprocessing: true,   // true handles punctuation / numbers better
+        model:                "bulbul:v2",
+      }),
+    })
+
+    if (!ttsRes.ok) {
+      const errText = await ttsRes.text()
+      console.error("[TTS] Sarvam error:", errText)
+      return NextResponse.json(
+        { error: "Sarvam TTS failed", details: errText },
+        { status: ttsRes.status }
+      )
+    }
+
+    const ttsData = await ttsRes.json()
+    console.log("[TTS] Sarvam response keys:", Object.keys(ttsData))
+
+    // Sarvam returns { audios: ["<base64>"] }
+    // Some versions return { audio: "<base64>" } â€” handle both
+    const audioBase64: string =
+      ttsData.audios?.[0] ??
+      ttsData.audio       ??
+      ""
+
+    if (!audioBase64) {
+      console.error("[TTS] No audio in response:", JSON.stringify(ttsData).slice(0, 300))
+      return NextResponse.json(
+        { error: "Sarvam TTS returned empty audio", raw: ttsData },
+        { status: 500 }
+      )
+    }
+
+    return NextResponse.json({ audioBase64, targetLanguage })
+
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.error("[TTS] Route error:", message)
+    return NextResponse.json({ error: message }, { status: 500 })
+  }
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\consultation\[visitId]\Consultationform.tsx =====
+// app/consultation/[visitId]/ConsultationForm.tsx
+"use client"
+
+import { useState, useRef, useEffect, useCallback } from "react"
+import Link from "next/link"
+
+/* â”€â”€ Types â”€â”€ */
+interface Message {
+  id:          string
+  role:        "patient" | "doctor"
+  text:        string        // original transcribed text
+  english:     string        // English version
+  hindi:       string        // Hindi version
+  kannada:     string        // Kannada version
+  timestamp:   string
+  language:    string        // original recording language
+  hasTTS?:     boolean       // doctor messages can be played to patient
+}
+
+interface MedicalReport {
+  chiefComplaint:           string
+  historyOfPresentIllness:  string
+  symptoms:                 string[]
+  examFindings:             string
+  diagnosis:                string
+  treatment:                string[]
+  medications:              string[]
+  investigations:           string[]
+  followUp:                 string
+  additionalNotes:          string
+}
+
+interface Props {
+  visitId:      string
+  department:   string
+  patientName:  string
+  patientAge:   number
+  patientGender?: string
+}
+
+const LANGUAGES = [
+  { code: "kn-IN", label: "à²•à²¨à³à²¨à²¡ (Kannada)" },
+  { code: "hi-IN", label: "à¤¹à¤¿à¤¨à¥à¤¦à¥€ (Hindi)"   },
+  { code: "en-IN", label: "English"           },
+]
+
+const LANG_LABELS: Record<string, string> = {
+  "en-IN": "English",
+  "hi-IN": "à¤¹à¤¿à¤¨à¥à¤¦à¥€",
+  "kn-IN": "à²•à²¨à³à²¨à²¡",
+}
+
+const REPORT_FIELDS: { key: keyof MedicalReport; label: string; icon: string; isArray: boolean }[] = [
+  { key: "chiefComplaint",          label: "Chief Complaint",            icon: "ðŸ¤’", isArray: false },
+  { key: "historyOfPresentIllness", label: "History of Illness",         icon: "ðŸ“‹", isArray: false },
+  { key: "symptoms",                label: "Symptoms",                   icon: "ðŸ”", isArray: true  },
+  { key: "examFindings",            label: "Examination Findings",       icon: "ðŸ©º", isArray: false },
+  { key: "diagnosis",               label: "Diagnosis",                  icon: "ðŸ”¬", isArray: false },
+  { key: "treatment",               label: "Treatment Plan",             icon: "ðŸ’Š", isArray: true  },
+  { key: "medications",             label: "Medications",                icon: "ðŸ’‰", isArray: true  },
+  { key: "investigations",          label: "Investigations",             icon: "ðŸ§ª", isArray: true  },
+  { key: "followUp",                label: "Follow-up",                  icon: "ðŸ“…", isArray: false },
+  { key: "additionalNotes",         label: "Additional Notes",           icon: "ðŸ“", isArray: false },
+]
+
+function uid()    { return Math.random().toString(36).slice(2, 9) }
+function nowTime(){ return new Date().toLocaleTimeString("en-IN", { hour:"2-digit", minute:"2-digit" }) }
+
+/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+export function ConsultationForm({ visitId, department, patientName, patientAge, patientGender }: Props) {
+
+  const [sessionActive,    setSessionActive]    = useState(false)
+  const [sessionSeconds,   setSessionSeconds]   = useState(0)
+  const [messages,         setMessages]         = useState<Message[]>([])
+  const [patientLang,      setPatientLang]      = useState("kn-IN")
+  const [doctorLang,       setDoctorLang]       = useState("en-IN")
+
+  // Display language for transcript panel (what language to show bubbles in)
+  const [transcriptLang,   setTranscriptLang]   = useState("en-IN")
+
+  const [patientRec,       setPatientRec]       = useState(false)
+  const [doctorRec,        setDoctorRec]        = useState(false)
+  const [patientTyping,    setPatientTyping]    = useState("")
+  const [doctorTyping,     setDoctorTyping]     = useState("")
+  const [patientLoading,   setPatientLoading]   = useState(false)
+  const [doctorLoading,    setDoctorLoading]    = useState(false)
+
+  const [tab,              setTab]              = useState<"transcript"|"report">("transcript")
+  const [report,           setReport]           = useState<MedicalReport | null>(null)
+  const [reportLoading,    setReportLoading]    = useState(false)
+  const [editingReport,    setEditingReport]    = useState(false)
+  const [reportEdits,      setReportEdits]      = useState<Record<string, string>>({})
+  const [saving,           setSaving]           = useState(false)
+  const [saved,            setSaved]            = useState(false)
+
+  // TTS state
+  const [playingMsgId,     setPlayingMsgId]     = useState<string | null>(null)
+  const [ttsLoading,       setTtsLoading]       = useState<string | null>(null)
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+
+  const timerRef       = useRef<ReturnType<typeof setInterval> | null>(null)
+  const patientMicRef  = useRef<MediaRecorder | null>(null)
+  const doctorMicRef   = useRef<MediaRecorder | null>(null)
+  const patientChunks  = useRef<Blob[]>([])
+  const doctorChunks   = useRef<Blob[]>([])
+  const bottomRef      = useRef<HTMLDivElement>(null)
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:"smooth" }) }, [messages])
+
+  useEffect(() => {
+    if (sessionActive) {
+      timerRef.current = setInterval(() => setSessionSeconds(s => s + 1), 1000)
+    } else {
+      if (timerRef.current) clearInterval(timerRef.current)
+    }
+    return () => { if (timerRef.current) clearInterval(timerRef.current) }
+  }, [sessionActive])
+
+  const fmt = (s: number) =>
+    `${Math.floor(s/60).toString().padStart(2,"0")}:${(s%60).toString().padStart(2,"0")}`
+
+  /* â”€â”€ Get display text for a message in chosen lang â”€â”€ */
+  const getMsgText = (msg: Message, lang: string) => {
+    if (lang === "en-IN") return msg.english || msg.text
+    if (lang === "hi-IN") return msg.hindi   || msg.text
+    if (lang === "kn-IN") return msg.kannada || msg.text
+    return msg.text
+  }
+
+  /* â”€â”€ Transcribe + get all 3 translations â”€â”€ */
+  const transcribeAll = useCallback(async (blob: Blob, lang: string) => {
+    const buf  = await blob.arrayBuffer()
+    const b64  = btoa(new Uint8Array(buf).reduce((d,b) => d + String.fromCharCode(b), ""))
+    const res  = await fetch("/api/sarvam/transcribe", {
+      method: "POST", headers: { "Content-Type":"application/json" },
+      body: JSON.stringify({ audioBase64: b64, languageCode: lang }),
+    })
+    const data = await res.json()
+    return {
+      original: (data.original ?? "") as string,
+      english:  (data.english  ?? "") as string,
+      hindi:    (data.hindi    ?? "") as string,
+      kannada:  (data.kannada  ?? "") as string,
+    }
+  }, [])
+
+  /* â”€â”€ Translate typed text to all 3 langs â”€â”€ */
+  const translateAll = useCallback(async (text: string, sourceLang: string) => {
+    const targets = ["en-IN", "hi-IN", "kn-IN"].filter(t => t !== sourceLang)
+    const results: Record<string, string> = { [sourceLang]: text }
+
+    await Promise.all(targets.map(async target => {
+      const res = await fetch("/api/sarvam/translate", {
+        method: "POST", headers: { "Content-Type":"application/json" },
+        body: JSON.stringify({ text, sourceLanguage: sourceLang }),
+      })
+      // The translate route translates to English; for other langs we chain
+      // Simpler: call transcribe with typed text hack â€” instead call translate directly
+      const data = await res.json()
+      results["en-IN"] = data.translatedText ?? text
+    }))
+
+    // For Hindi and Kannada, translate from English
+    if (sourceLang !== "hi-IN" && results["en-IN"]) {
+      const r = await fetch("/api/sarvam/translate", {
+        method: "POST", headers: { "Content-Type":"application/json" },
+        body: JSON.stringify({ text: results["en-IN"], sourceLanguage: "en-IN", targetLanguage: "hi-IN" }),
+      })
+      const d = await r.json(); results["hi-IN"] = d.translatedText ?? results["en-IN"]
+    }
+    if (sourceLang !== "kn-IN" && results["en-IN"]) {
+      const r = await fetch("/api/sarvam/translate", {
+        method: "POST", headers: { "Content-Type":"application/json" },
+        body: JSON.stringify({ text: results["en-IN"], sourceLanguage: "en-IN", targetLanguage: "kn-IN" }),
+      })
+      const d = await r.json(); results["kn-IN"] = d.translatedText ?? results["en-IN"]
+    }
+    if (!results["en-IN"]) results["en-IN"] = text
+    if (!results["hi-IN"]) results["hi-IN"] = text
+    if (!results["kn-IN"]) results["kn-IN"] = text
+
+    return results
+  }, [])
+
+  const addMsg = useCallback((
+    role: "patient"|"doctor",
+    text: string, english: string, hindi: string, kannada: string, lang: string
+  ) => {
+    setMessages(prev => [...prev, {
+      id: uid(), role, text, english, hindi, kannada,
+      timestamp: nowTime(), language: lang, hasTTS: role === "doctor",
+    }])
+  }, [])
+
+  /* â”€â”€ Recording â”€â”€ */
+  const startRecording = useCallback(async (role: "patient"|"doctor") => {
+    try {
+      const stream   = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" })
+      const chunks: Blob[] = []
+      recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data) }
+      if (role === "patient") { patientChunks.current = chunks; patientMicRef.current = recorder; setPatientRec(true) }
+      else                    { doctorChunks.current  = chunks; doctorMicRef.current  = recorder; setDoctorRec(true)  }
+      recorder.start()
+    } catch { alert("Microphone access denied.") }
+  }, [])
+
+  const stopRecording = useCallback(async (role: "patient"|"doctor") => {
+    const recorder = role === "patient" ? patientMicRef.current : doctorMicRef.current
+    const lang     = role === "patient" ? patientLang : doctorLang
+    const chunks   = role === "patient" ? patientChunks.current : doctorChunks.current
+    const setRec   = role === "patient" ? setPatientRec  : setDoctorRec
+    const setLoad  = role === "patient" ? setPatientLoading : setDoctorLoading
+    if (!recorder) return
+    setRec(false); setLoad(true)
+    recorder.onstop = async () => {
+      try {
+        const blob   = new Blob(chunks, { type: "audio/webm" })
+        const result = await transcribeAll(blob, lang)
+        if (result.original.trim()) {
+          addMsg(role, result.original, result.english, result.hindi, result.kannada, lang)
+        }
+      } finally { setLoad(false); recorder.stream.getTracks().forEach(t => t.stop()) }
+    }
+    recorder.stop()
+  }, [patientLang, doctorLang, transcribeAll, addMsg])
+
+  /* â”€â”€ Typed send â”€â”€ */
+  const sendTyped = useCallback(async (role: "patient"|"doctor") => {
+    const text  = (role === "patient" ? patientTyping : doctorTyping).trim()
+    const lang  = role === "patient" ? patientLang : doctorLang
+    if (!text) return
+    role === "patient" ? setPatientTyping("") : setDoctorTyping("")
+    const setLoad = role === "patient" ? setPatientLoading : setDoctorLoading
+    setLoad(true)
+    try {
+      const result = await translateAll(text, lang)
+      addMsg(role, text,
+        result["en-IN"] ?? text,
+        result["hi-IN"] ?? text,
+        result["kn-IN"] ?? text,
+        lang
+      )
+    } finally { setLoad(false) }
+  }, [patientTyping, doctorTyping, patientLang, doctorLang, translateAll, addMsg])
+
+  /* TTS: play doctor reply in chosen language (EN / HI / KN) */
+  // ttsKey = `${msg.id}:${lang}` so each language button has independent state
+  const playTTS = useCallback(async (msg: Message, lang: string) => {
+    const key = `${msg.id}:${lang}`
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current.src = "" }
+    if (playingMsgId === key) { setPlayingMsgId(null); return }  // toggle off
+
+    setTtsLoading(key)
+    try {
+      const textToSpeak = getMsgText(msg, lang)
+      if (!textToSpeak?.trim()) throw new Error("No text available for this language")
+
+      const res = await fetch("/api/sarvam/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: textToSpeak, targetLanguage: lang }),
+      })
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({})) as Record<string, string>
+        throw new Error(errData.details ?? errData.error ?? `HTTP ${res.status}`)
+      }
+
+      const data = await res.json() as { audioBase64?: string }
+      if (!data.audioBase64) throw new Error("Sarvam returned no audio field")
+
+      const binary = atob(data.audioBase64)
+      const bytes  = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+      const blob   = new Blob([bytes], { type: "audio/wav" })
+      const url    = URL.createObjectURL(blob)
+
+      const audio  = new Audio(url)
+      audioRef.current = audio
+      setPlayingMsgId(key)
+      audio.onended = () => { setPlayingMsgId(null); URL.revokeObjectURL(url) }
+      audio.onerror = () => { setPlayingMsgId(null); URL.revokeObjectURL(url) }
+      await audio.play()
+    } catch (err) {
+      console.error("[TTS] play error:", err)
+      alert(`TTS failed: ${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setTtsLoading(null)
+    }
+  }, [ttsLoading, playingMsgId])
+
+  const stopTTS = useCallback(() => {
+    audioRef.current?.pause()
+    setPlayingMsgId(null)
+  }, [])
+
+
+  /* â”€â”€ Generate report â”€â”€ */
+  const generateReport = useCallback(async () => {
+    if (!messages.length) return
+    setReportLoading(true); setTab("report")
+    try {
+      const res  = await fetch("/api/sarvam/report", {
+        method: "POST", headers: { "Content-Type":"application/json" },
+        body: JSON.stringify({ messages, patientName, patientAge, patientGender, department }),
+      })
+      const data = await res.json()
+      const r    = data.report as MedicalReport
+      setReport(r)
+      // Pre-populate edit state
+      const edits: Record<string, string> = {}
+      REPORT_FIELDS.forEach(f => {
+        const val = r[f.key]
+        edits[f.key] = Array.isArray(val) ? val.join("\n") : String(val ?? "")
+      })
+      setReportEdits(edits)
+    } finally { setReportLoading(false) }
+  }, [messages, patientName, patientAge, patientGender, department])
+
+  /* â”€â”€ Download PDF â”€â”€ */
+  const downloadPDF = useCallback(() => {
+    const finalReport = editingReport
+      ? Object.fromEntries(REPORT_FIELDS.map(f => [
+          f.key,
+          f.isArray ? (reportEdits[f.key] ?? "").split("\n").filter(Boolean) : (reportEdits[f.key] ?? "")
+        ]))
+      : report
+
+    if (!finalReport) return
+
+    const now     = new Date().toLocaleString("en-IN")
+    const deptLbl = department.replace(/_/g, " ")
+
+    const htmlContent = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8"/>
+<title>Medical Report â€“ ${patientName}</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family: 'Inter', Arial, sans-serif; color: #1a1a2e; background: #fff; padding: 40px; font-size: 13px; }
+  .header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:28px; padding-bottom:20px; border-bottom:2px solid #0ea5e9; }
+  .logo { font-size:20px; font-weight:700; color:#0ea5e9; }
+  .logo span { color:#1a1a2e; }
+  .report-title { font-size:22px; font-weight:700; color:#1a1a2e; margin-bottom:4px; }
+  .meta { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; background:#f0f9ff; border:1px solid #bae6fd; border-radius:10px; padding:16px; margin-bottom:24px; }
+  .meta-item label { font-size:10px; font-weight:600; text-transform:uppercase; color:#0284c7; letter-spacing:0.06em; display:block; margin-bottom:3px; }
+  .meta-item span  { font-size:13px; font-weight:500; color:#1a1a2e; }
+  .section { margin-bottom:18px; break-inside:avoid; }
+  .section-header { display:flex; align-items:center; gap:8px; background:#0ea5e9; color:#fff; padding:8px 14px; border-radius:7px 7px 0 0; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; }
+  .section-body   { background:#f8fafc; border:1px solid #e2e8f0; border-top:none; border-radius:0 0 7px 7px; padding:12px 14px; }
+  .section-body p { color:#334155; line-height:1.65; }
+  .tag-list { display:flex; flex-wrap:wrap; gap:6px; margin-top:4px; }
+  .tag { background:#dbeafe; color:#1d4ed8; border:1px solid #93c5fd; border-radius:100px; padding:3px 10px; font-size:12px; font-weight:500; }
+  .tag.green  { background:#dcfce7; color:#166534; border-color:#86efac; }
+  .tag.amber  { background:#fef9c3; color:#854d0e; border-color:#fde047; }
+  .tag.purple { background:#f3e8ff; color:#7e22ce; border-color:#d8b4fe; }
+  .footer { margin-top:32px; padding-top:16px; border-top:1px solid #e2e8f0; display:flex; justify-content:space-between; font-size:11px; color:#94a3b8; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <div class="logo">âš• MediLingua <span>AI</span></div>
+    <div style="font-size:11px;color:#64748b;margin-top:4px">AI-Powered Medical Documentation</div>
+  </div>
+  <div style="text-align:right">
+    <div class="report-title">Consultation Report</div>
+    <div style="font-size:12px;color:#64748b">${now}</div>
+  </div>
+</div>
+
+<div class="meta">
+  <div class="meta-item"><label>Patient Name</label><span>${patientName}</span></div>
+  <div class="meta-item"><label>Age</label><span>${patientAge} years</span></div>
+  <div class="meta-item"><label>Gender</label><span>${patientGender ?? "Not specified"}</span></div>
+  <div class="meta-item"><label>Department</label><span>${deptLbl}</span></div>
+  <div class="meta-item"><label>Visit ID</label><span style="font-size:11px">${visitId}</span></div>
+  <div class="meta-item"><label>Messages</label><span>${messages.length} recorded</span></div>
+</div>
+
+<div class="section">
+  <div class="section-header">ðŸ¤’ Chief Complaint</div>
+  <div class="section-body"><p>${finalReport.chiefComplaint || "Not documented"}</p></div>
+</div>
+
+<div class="section">
+  <div class="section-header">ðŸ“‹ History of Present Illness</div>
+  <div class="section-body"><p>${finalReport.historyOfPresentIllness || "Not documented"}</p></div>
+</div>
+
+<div class="grid2">
+<div class="section">
+  <div class="section-header">ðŸ” Symptoms</div>
+  <div class="section-body">
+    <div class="tag-list">
+      ${(Array.isArray(finalReport.symptoms) ? finalReport.symptoms : [finalReport.symptoms]).filter(Boolean).map((s: string) => `<span class="tag">${s}</span>`).join("") || "<p>Not documented</p>"}
+    </div>
+  </div>
+</div>
+<div class="section">
+  <div class="section-header">ðŸ©º Examination Findings</div>
+  <div class="section-body"><p>${finalReport.examFindings || "Not documented"}</p></div>
+</div>
+</div>
+
+<div class="section">
+  <div class="section-header">ðŸ”¬ Diagnosis</div>
+  <div class="section-body"><p style="font-weight:600;color:#0f172a">${finalReport.diagnosis || "Pending"}</p></div>
+</div>
+
+<div class="grid2">
+<div class="section">
+  <div class="section-header">ðŸ’Š Treatment Plan</div>
+  <div class="section-body">
+    <div class="tag-list">
+      ${(Array.isArray(finalReport.treatment) ? finalReport.treatment : [finalReport.treatment]).filter(Boolean).map((t: string) => `<span class="tag green">${t}</span>`).join("") || "<p>Not documented</p>"}
+    </div>
+  </div>
+</div>
+<div class="section">
+  <div class="section-header">ðŸ’‰ Medications</div>
+  <div class="section-body">
+    <div class="tag-list">
+      ${(Array.isArray(finalReport.medications) ? finalReport.medications : [finalReport.medications]).filter(Boolean).map((m: string) => `<span class="tag amber">${m}</span>`).join("") || "<p>None prescribed</p>"}
+    </div>
+  </div>
+</div>
+</div>
+
+<div class="section">
+  <div class="section-header">ðŸ§ª Investigations Ordered</div>
+  <div class="section-body">
+    <div class="tag-list">
+      ${(Array.isArray(finalReport.investigations) ? finalReport.investigations : [finalReport.investigations]).filter(Boolean).map((i: string) => `<span class="tag purple">${i}</span>`).join("") || "<p>None ordered</p>"}
+    </div>
+  </div>
+</div>
+
+<div class="grid2">
+<div class="section">
+  <div class="section-header">ðŸ“… Follow-up Instructions</div>
+  <div class="section-body"><p>${finalReport.followUp || "As needed"}</p></div>
+</div>
+<div class="section">
+  <div class="section-header">ðŸ“ Additional Notes</div>
+  <div class="section-body"><p>${finalReport.additionalNotes || "â€”"}</p></div>
+</div>
+</div>
+
+<div class="footer">
+  <span>Generated by MediLingua AI Â· ${now}</span>
+  <span>CONFIDENTIAL â€” For clinical use only</span>
+</div>
+</body>
+</html>`
+
+    // Open in new tab and trigger print/save as PDF
+    const win = window.open("", "_blank")
+    if (win) {
+      win.document.write(htmlContent)
+      win.document.close()
+      setTimeout(() => win.print(), 500)
+    }
+  }, [report, reportEdits, editingReport, patientName, patientAge, patientGender, department, visitId, messages.length])
+
+  /* â”€â”€ Save to DB â”€â”€ */
+  const handleSave = useCallback(async () => {
+    setSaving(true)
+    try {
+      const finalReport = editingReport
+        ? Object.fromEntries(REPORT_FIELDS.map(f => [
+            f.key,
+            f.isArray ? (reportEdits[f.key] ?? "").split("\n").filter(Boolean) : (reportEdits[f.key] ?? "")
+          ]))
+        : report
+      await fetch(`/api/consultation/${visitId}/save`, {
+        method: "POST", headers: { "Content-Type":"application/json" },
+        body: JSON.stringify({ messages, report: finalReport, language: patientLang }),
+      })
+      setSaved(true); setTimeout(() => setSaved(false), 3000)
+    } finally { setSaving(false) }
+  }, [messages, report, reportEdits, editingReport, visitId, patientLang])
+
+  const endSession = useCallback(() => {
+    setSessionActive(false)
+    if (messages.length) generateReport()
+  }, [messages.length, generateReport])
+
+  /* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ RENDER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+
+  const renderPanel = (role: "patient"|"doctor") => {
+    const isPat    = role === "patient"
+    const lang     = isPat ? patientLang    : doctorLang
+    const setLang  = isPat ? setPatientLang : setDoctorLang
+    const rec      = isPat ? patientRec     : doctorRec
+    const typing   = isPat ? patientTyping  : doctorTyping
+    const setTyping= isPat ? setPatientTyping : setDoctorTyping
+    const loading  = isPat ? patientLoading : doctorLoading
+    const panelMsgs= messages.filter(m => m.role === role)
+
+    return (
+      <div style={{ flex:1, display:"flex", flexDirection:"column", borderRight: isPat ? "1px solid rgba(56,189,248,0.08)" : "none", background:"rgba(8,12,20,0.45)", minWidth:0 }}>
+
+        {/* Header */}
+        <div style={{ padding:"13px 18px", borderBottom:"1px solid rgba(56,189,248,0.08)", display:"flex", alignItems:"center", justifyContent:"space-between", flexShrink:0, background:"rgba(8,12,20,0.6)" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+            <div style={{ width:34, height:34, borderRadius:"50%", background: isPat?"rgba(56,189,248,0.1)":"linear-gradient(135deg,rgba(56,189,248,0.2),rgba(14,165,233,0.1))", border:"1px solid rgba(56,189,248,0.2)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>
+              {isPat ? "ðŸ‘¤" : "ðŸ‘¨â€âš•ï¸"}
+            </div>
+            <div>
+              <div style={{ fontSize:13, fontWeight:600, color:"#e8edf5" }}>{isPat ? "Patient" : "Doctor"}</div>
+              <div style={{ fontSize:11, color:"#4a5568" }}>{isPat ? patientName : "Consultation Notes"}</div>
+            </div>
+          </div>
+          <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+            <span style={{ fontSize:10, color:"#4a5568", textTransform:"uppercase", letterSpacing:"0.08em" }}>Speaking:</span>
+            <select
+              value={lang} onChange={e => setLang(e.target.value)}
+              style={{ background:"rgba(8,12,20,0.9)", border:"1px solid rgba(56,189,248,0.15)", borderRadius:7, padding:"4px 9px", fontSize:12, color:"#8b9ab5", fontFamily:"'DM Sans',sans-serif", outline:"none", cursor:"pointer" }}
+            >
+              {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
+            </select>
+          </div>
+        </div>
+
+        {/* Messages */}
+        <div style={{ flex:1, overflowY:"auto", padding:"14px 18px", display:"flex", flexDirection:"column", gap:10 }}>
+          {panelMsgs.length === 0 && (
+            <div style={{ textAlign:"center", marginTop:32, color:"#4a5568", fontSize:13 }}>
+              {sessionActive ? `${isPat?"Patient":"Doctor"} speech appears hereâ€¦` : "Start session to begin"}
+            </div>
+          )}
+
+          {panelMsgs.map(msg => (
+            <div key={msg.id} style={{ alignSelf: isPat?"flex-start":"flex-end", maxWidth:"92%", animation:"slideUp 0.3s ease both" }}>
+              <div style={{ background: isPat?"rgba(13,19,33,0.92)":"rgba(14,165,233,0.08)", border:`1px solid rgba(56,189,248,${isPat?0.15:0.22})`, borderRadius: isPat?"12px 12px 12px 4px":"12px 12px 4px 12px", padding:"11px 14px" }}>
+
+                {/* Original text */}
+                <div style={{ fontSize:14, color:"#e8edf5", lineHeight:1.55, marginBottom:6 }}>{msg.text}</div>
+
+                {/* All 3 translations */}
+                <div style={{ borderTop:"1px solid rgba(56,189,248,0.08)", paddingTop:8, display:"flex", flexDirection:"column", gap:5 }}>
+                  {[
+                    { code:"en-IN", label:"EN", text: msg.english  },
+                    { code:"hi-IN", label:"HI", text: msg.hindi    },
+                    { code:"kn-IN", label:"KN", text: msg.kannada  },
+                  ].filter(t => t.code !== msg.language && t.text && t.text !== msg.text).map(t => (
+                    <div key={t.code} style={{ display:"flex", gap:7, alignItems:"flex-start" }}>
+                      <span style={{ fontSize:9, fontWeight:700, color:"#38bdf8", background:"rgba(56,189,248,0.1)", border:"1px solid rgba(56,189,248,0.2)", borderRadius:4, padding:"1px 5px", flexShrink:0, marginTop:2 }}>{t.label}</span>
+                      <span style={{ fontSize:12, color:"#8b9ab5", lineHeight:1.5 }}>{t.text}</span>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Bottom row: timestamp + TTS button for doctor messages */}
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginTop:8 }}>
+                  <div style={{ display:"flex", gap:7, alignItems:"center" }}>
+                    <span style={{ fontSize:11, color:"#4a5568" }}>{msg.timestamp}</span>
+                    <span style={{ fontSize:10, color:"#4a5568", background:"rgba(56,189,248,0.06)", borderRadius:4, padding:"1px 6px" }}>ðŸŽ¤ {LANG_LABELS[msg.language]}</span>
+                  </div>
+
+                  {/* TTS: 3 language play buttons for doctor messages */}
+                  {!isPat && (
+                    <div style={{ display:"flex", gap:5, alignItems:"center" }}>
+                      <span style={{ fontSize:9, color:"#4a5568", textTransform:"uppercase" as const, letterSpacing:"0.07em" }}>Play:</span>
+                      {([
+                        { code:"en-IN", label:"EN" },
+                        { code:"hi-IN", label:"HI" },
+                        { code:"kn-IN", label:"KN" },
+                      ] as const).map(({ code, label }) => {
+                        const key       = `${msg.id}:${code}`
+                        const isPlaying = playingMsgId === key
+                        const isLoading = ttsLoading   === key
+                        const otherBusy = !!ttsLoading && ttsLoading !== key
+                        return (
+                          <button
+                            key={code}
+                            onClick={() => isPlaying ? stopTTS() : playTTS(msg, code)}
+                            disabled={otherBusy}
+                            title={`Play in ${LANG_LABELS[code]}`}
+                            style={{
+                              display:"flex", alignItems:"center", gap:3,
+                              background: isPlaying ? "rgba(52,211,153,0.15)" : "rgba(56,189,248,0.07)",
+                              border: `1px solid ${isPlaying ? "rgba(52,211,153,0.4)" : "rgba(56,189,248,0.18)"}`,
+                              borderRadius:6, padding:"3px 8px",
+                              fontSize:10, fontWeight:700,
+                              color: isPlaying ? "#34d399" : "#38bdf8",
+                              cursor: otherBusy ? "not-allowed" : "pointer",
+                              fontFamily:"'DM Sans',sans-serif", transition:"all 0.2s",
+                              opacity: otherBusy ? 0.35 : 1, minWidth:36,
+                            }}
+                          >
+                            {isLoading
+                              ? <span style={{ width:9,height:9,border:"1.5px solid rgba(56,189,248,0.3)",borderTopColor:"#38bdf8",borderRadius:"50%",animation:"spin 0.7s linear infinite",display:"inline-block" }} />
+                              : isPlaying ? "â¹" : "â–¶"
+                            }
+                            {" "}{label}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+
+          {loading && (
+            <div style={{ display:"flex", alignItems:"center", gap:7, color:"#4a5568", fontSize:13 }}>
+              <span style={{ width:14,height:14,border:"2px solid rgba(56,189,248,0.2)",borderTopColor:"#38bdf8",borderRadius:"50%",animation:"spin 0.7s linear infinite",display:"inline-block" }} />
+              Transcribing all languagesâ€¦
+            </div>
+          )}
+
+          {isPat && <div ref={bottomRef} />}
+        </div>
+
+        {/* Input bar */}
+        <div style={{ padding:"12px 14px", borderTop:"1px solid rgba(56,189,248,0.08)", background:"rgba(8,12,20,0.85)", flexShrink:0 }}>
+          {rec && (
+            <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:8 }}>
+              {[0,1,2,3,4,5].map(i => (
+                <div key={i} style={{ width:3, borderRadius:2, background:"#ef4444", animation:`waveform 0.6s ${i*0.09}s ease-in-out infinite` }} />
+              ))}
+              <span style={{ fontSize:11, color:"#ef4444", fontWeight:500, marginLeft:4 }}>Recordingâ€¦ tap â¹ to stop</span>
+            </div>
+          )}
+          <div style={{ display:"flex", gap:9, alignItems:"flex-end" }}>
+            <button
+              onClick={() => sessionActive && (rec ? stopRecording(role) : startRecording(role))}
+              disabled={!sessionActive}
+              style={{ width:42,height:42,borderRadius:"50%",border:`1px solid rgba(${rec?"239,68,68":"56,189,248"},${rec?0.4:0.2})`, background:`rgba(${rec?"239,68,68":"56,189,248"},${rec?0.15:0.1})`,cursor:sessionActive?"pointer":"not-allowed",display:"flex",alignItems:"center",justifyContent:"center",fontSize:19,flexShrink:0,position:"relative",transition:"all 0.2s" }}
+            >
+              {rec ? "â¹" : "ðŸŽ¤"}
+              {rec && <span style={{ position:"absolute",inset:-4,borderRadius:"50%",border:"2px solid rgba(239,68,68,0.5)",animation:"ripple 1.2s ease-out infinite" }} />}
+            </button>
+            <textarea
+              rows={1}
+              placeholder={isPat ? "Type your messageâ€¦" : "Type your responseâ€¦"}
+              value={typing}
+              onChange={e => setTyping(e.target.value)}
+              onKeyDown={e => { if (e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); sendTyped(role) } }}
+              disabled={!sessionActive}
+              style={{ flex:1,background:"rgba(8,12,20,0.8)",border:"1px solid rgba(56,189,248,0.12)",borderRadius:9,padding:"10px 13px",fontSize:14,color:"#e8edf5",fontFamily:"'DM Sans',sans-serif",outline:"none",resize:"none",caretColor:"#38bdf8",lineHeight:"1.5" }}
+            />
+            <button
+              onClick={() => sendTyped(role)}
+              disabled={!sessionActive || !typing.trim()}
+              style={{ width:36,height:36,borderRadius:8,border:"none",cursor:sessionActive&&typing.trim()?"pointer":"not-allowed",background:"linear-gradient(135deg,#38bdf8,#0ea5e9)",color:"#080c14",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,flexShrink:0,opacity:sessionActive&&typing.trim()?1:0.4,transition:"all 0.2s" }}
+            >âž¤</button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  /* â”€â”€â”€ MAIN RETURN â”€â”€â”€ */
+  return (
+    <div style={{ minHeight:"100vh", background:"#080c14", color:"#e8edf5", fontFamily:"'DM Sans','Segoe UI',sans-serif", display:"flex", flexDirection:"column" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&family=Syne:wght@700;800&display=swap');
+        * { box-sizing:border-box; margin:0; padding:0; }
+        body::after { content:''; position:fixed; inset:0; background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.03) 2px,rgba(0,0,0,0.03) 4px); pointer-events:none; z-index:9999; }
+        @keyframes fadeIn  { from{opacity:0}to{opacity:1} }
+        @keyframes slideUp { from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)} }
+        @keyframes pulse   { 0%,100%{opacity:1}50%{opacity:0.4} }
+        @keyframes spin    { to{transform:rotate(360deg)} }
+        @keyframes ripple  { 0%{transform:scale(1);opacity:0.7}100%{transform:scale(2.2);opacity:0} }
+        @keyframes waveform{ 0%,100%{height:5px}50%{height:20px} }
+        option { background:#0d1321; color:#e8edf5; }
+      `}</style>
+
+      {/* â”€â”€ Navbar â”€â”€ */}
+      <nav style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"12px 22px", background:"rgba(8,12,20,0.96)", backdropFilter:"blur(20px)", borderBottom:"1px solid rgba(56,189,248,0.1)", flexShrink:0, zIndex:100 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:9 }}>
+          <div style={{ width:28,height:28,background:"linear-gradient(135deg,#38bdf8,#0ea5e9)",borderRadius:7,display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,boxShadow:"0 0 12px rgba(56,189,248,0.35)" }}>âš•</div>
+          <span style={{ fontFamily:"'Syne',sans-serif",fontSize:16,fontWeight:700,color:"#e8edf5",letterSpacing:"-0.02em" }}>
+            MediLingua <span style={{ color:"#38bdf8" }}>AI</span>
+          </span>
+        </div>
+        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          {sessionActive && (
+            <>
+              <div style={{ display:"flex",alignItems:"center",gap:6,background:"rgba(52,211,153,0.08)",border:"1px solid rgba(52,211,153,0.25)",borderRadius:100,padding:"4px 12px" }}>
+                <span style={{ width:5,height:5,background:"#34d399",borderRadius:"50%",animation:"pulse 1.5s infinite" }} />
+                <span style={{ fontSize:11,color:"#34d399",fontWeight:600 }}>Session Active</span>
+              </div>
+              <div style={{ background:"rgba(13,19,33,0.9)",border:"1px solid rgba(56,189,248,0.15)",borderRadius:100,padding:"4px 13px",fontSize:12,fontWeight:600,color:"#e8edf5",fontVariantNumeric:"tabular-nums" }}>
+                â± {fmt(sessionSeconds)}
+              </div>
+            </>
+          )}
+          {!sessionActive
+            ? <button onClick={() => setSessionActive(true)} style={{ background:"linear-gradient(135deg,#38bdf8,#0ea5e9)",color:"#080c14",padding:"8px 18px",borderRadius:8,border:"none",fontSize:13,fontWeight:700,fontFamily:"'DM Sans',sans-serif",cursor:"pointer" }}>â–¶ Start</button>
+            : <button onClick={endSession} style={{ background:"rgba(239,68,68,0.1)",color:"#ef4444",padding:"8px 18px",borderRadius:8,border:"1px solid rgba(239,68,68,0.3)",fontSize:13,fontWeight:700,fontFamily:"'DM Sans',sans-serif",cursor:"pointer" }}>âœ• End Session</button>
+          }
+          <Link href="/doctor/dashboard" style={{ fontSize:12,color:"#8b9ab5",textDecoration:"none",padding:"6px 11px",borderRadius:7,border:"1px solid rgba(56,189,248,0.1)" }}>â† Queue</Link>
+        </div>
+      </nav>
+
+      {/* Patient strip */}
+      <div style={{ background:"rgba(13,19,33,0.7)",borderBottom:"1px solid rgba(56,189,248,0.08)",padding:"8px 22px",display:"flex",gap:18,alignItems:"center",flexShrink:0 }}>
+        <span style={{ fontSize:12,color:"#8b9ab5" }}>Patient: <b style={{ color:"#e8edf5" }}>{patientName}</b></span>
+        <span style={{ fontSize:12,color:"#8b9ab5" }}>Age: <b style={{ color:"#e8edf5" }}>{patientAge}</b></span>
+        <span style={{ fontSize:12,color:"#8b9ab5" }}>Dept: <b style={{ color:"#38bdf8" }}>{department.replace(/_/g," ")}</b></span>
+        <span style={{ marginLeft:"auto",fontSize:11,color:sessionActive?"#34d399":"#4a5568" }}>
+          {sessionActive ? `${messages.length} message${messages.length!==1?"s":""}` : "Session not started"}
+        </span>
+      </div>
+
+      {/* â”€â”€ Dual panels â”€â”€ */}
+      <div style={{ flex:1, display:"flex", overflow:"hidden", minHeight:0 }}>
+        {renderPanel("patient")}
+        <div style={{ width:44,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,background:"rgba(8,12,20,0.25)" }}>
+          <div style={{ width:28,height:28,borderRadius:"50%",background:"rgba(56,189,248,0.05)",border:"1px solid rgba(56,189,248,0.1)",display:"flex",alignItems:"center",justifyContent:"center",color:"#4a5568",fontSize:12 }}>â‡„</div>
+        </div>
+        {renderPanel("doctor")}
+      </div>
+
+      {/* â”€â”€ Bottom panel â”€â”€ */}
+      <div style={{ height:310,flexShrink:0,borderTop:"1px solid rgba(56,189,248,0.12)",background:"rgba(10,15,26,0.97)",display:"flex",flexDirection:"column" }}>
+
+        {/* Tab bar */}
+        <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 18px",borderBottom:"1px solid rgba(56,189,248,0.08)",flexShrink:0 }}>
+          <div style={{ display:"flex",gap:6,alignItems:"center" }}>
+            {(["transcript","report"] as const).map(t => (
+              <button key={t} onClick={() => setTab(t)} style={{ padding:"6px 16px",borderRadius:7,border:`1px solid ${tab===t?"rgba(56,189,248,0.3)":"transparent"}`,background:tab===t?"rgba(56,189,248,0.1)":"transparent",color:tab===t?"#38bdf8":"#8b9ab5",fontSize:12,fontWeight:500,fontFamily:"'DM Sans',sans-serif",cursor:"pointer",display:"flex",alignItems:"center",gap:6 }}>
+                {t==="transcript" ? "ðŸ“ Transcript" : "ðŸ“‹ Report"}
+                {t==="report" && report && <span style={{ width:6,height:6,background:"#34d399",borderRadius:"50%",display:"inline-block" }} />}
+              </button>
+            ))}
+
+            {/* Transcript language selector */}
+            {tab === "transcript" && (
+              <div style={{ display:"flex",alignItems:"center",gap:6,marginLeft:8 }}>
+                <span style={{ fontSize:10,color:"#4a5568",textTransform:"uppercase",letterSpacing:"0.08em" }}>Show in:</span>
+                <select
+                  value={transcriptLang} onChange={e => setTranscriptLang(e.target.value)}
+                  style={{ background:"rgba(8,12,20,0.9)",border:"1px solid rgba(56,189,248,0.15)",borderRadius:6,padding:"3px 8px",fontSize:11,color:"#8b9ab5",fontFamily:"'DM Sans',sans-serif",outline:"none",cursor:"pointer" }}
+                >
+                  {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
+                </select>
+              </div>
+            )}
+          </div>
+
+          <div style={{ display:"flex",gap:8 }}>
+            {tab==="report" && report && (
+              <>
+                <button onClick={() => setEditingReport(e => !e)} style={{ background:"transparent",border:"1px solid rgba(56,189,248,0.2)",borderRadius:7,padding:"5px 12px",fontSize:11,color:"#38bdf8",cursor:"pointer",fontFamily:"'DM Sans',sans-serif" }}>
+                  {editingReport ? "âœ“ Done" : "âœ Edit"}
+                </button>
+                <button onClick={downloadPDF} style={{ background:"rgba(52,211,153,0.08)",border:"1px solid rgba(52,211,153,0.25)",borderRadius:7,padding:"5px 12px",fontSize:11,color:"#34d399",cursor:"pointer",fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",gap:5 }}>
+                  â¬‡ Download PDF
+                </button>
+              </>
+            )}
+            <button onClick={generateReport} disabled={!messages.length||reportLoading} style={{ background:"rgba(56,189,248,0.08)",border:"1px solid rgba(56,189,248,0.2)",borderRadius:7,padding:"5px 12px",fontSize:11,color:"#38bdf8",cursor:messages.length?"pointer":"not-allowed",fontFamily:"'DM Sans',sans-serif",opacity:messages.length?1:0.4,display:"flex",alignItems:"center",gap:5 }}>
+              {reportLoading ? <><span style={{ width:11,height:11,border:"1.5px solid rgba(56,189,248,0.2)",borderTopColor:"#38bdf8",borderRadius:"50%",animation:"spin 0.7s linear infinite",display:"inline-block" }} /> Generatingâ€¦</> : "âš¡ Generate"}
+            </button>
+            <button onClick={handleSave} disabled={saving||!messages.length} style={{ background:"linear-gradient(135deg,#38bdf8,#0ea5e9)",color:"#080c14",padding:"5px 18px",borderRadius:7,border:"none",fontSize:12,fontWeight:700,fontFamily:"'DM Sans',sans-serif",cursor:messages.length?"pointer":"not-allowed",opacity:messages.length?1:0.5,display:"flex",alignItems:"center",gap:5 }}>
+              {saving ? <><span style={{ width:11,height:11,border:"1.5px solid rgba(8,12,20,0.3)",borderTopColor:"#080c14",borderRadius:"50%",animation:"spin 0.7s linear infinite",display:"inline-block" }} /> Savingâ€¦</> : saved ? "âœ“ Saved!" : "ðŸ’¾ Save"}
+            </button>
+          </div>
+        </div>
+
+        {/* Content */}
+        <div style={{ flex:1,overflowY:"auto",padding:"12px 18px" }}>
+
+          {/* â”€â”€ Transcript tab â”€â”€ */}
+          {tab==="transcript" && (
+            <div style={{ display:"flex",flexDirection:"column",gap:6 }}>
+              {messages.length===0 && <div style={{ textAlign:"center",color:"#4a5568",fontSize:12,marginTop:14 }}>Conversation transcript will appear here. Select a language above to change the display language.</div>}
+              {messages.map(msg => (
+                <div key={msg.id} style={{ display:"flex",gap:9,alignItems:"flex-start",animation:"fadeIn 0.3s ease" }}>
+                  <span style={{ fontSize:10,color:"#4a5568",minWidth:34,marginTop:2,fontVariantNumeric:"tabular-nums" }}>{msg.timestamp}</span>
+                  <span style={{ fontSize:11,fontWeight:700,minWidth:50,color:msg.role==="patient"?"#38bdf8":"#34d399" }}>{msg.role==="patient"?"Patient":"Doctor"}</span>
+                  <span style={{ fontSize:13,color:"#e8edf5",lineHeight:1.55,flex:1 }}>
+                    {getMsgText(msg, transcriptLang)}
+                  </span>
+                  <span style={{ fontSize:9,color:"#4a5568",background:"rgba(56,189,248,0.06)",borderRadius:4,padding:"1px 5px",flexShrink:0,marginTop:2 }}>
+                    {LANG_LABELS[msg.language]}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* â”€â”€ Report tab â”€â”€ */}
+          {tab==="report" && (
+            <div>
+              {reportLoading && <div style={{ display:"flex",alignItems:"center",gap:9,color:"#8b9ab5",fontSize:13,justifyContent:"center",marginTop:20 }}><span style={{ width:16,height:16,border:"2px solid rgba(56,189,248,0.2)",borderTopColor:"#38bdf8",borderRadius:"50%",animation:"spin 0.7s linear infinite",display:"inline-block" }} /> Generating structured report with AIâ€¦</div>}
+              {!reportLoading&&!report && <div style={{ textAlign:"center",color:"#4a5568",fontSize:12,marginTop:14 }}>Click "âš¡ Generate" after the consultation to build a structured medical report.</div>}
+              {!reportLoading&&report && (
+                <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))",gap:8 }}>
+                  {REPORT_FIELDS.map(f => {
+                    const val = report[f.key]
+                    const isEmpty = Array.isArray(val) ? val.length===0 : !val
+                    return (
+                      <div key={f.key} style={{ background:"rgba(13,19,33,0.75)",border:`1px solid rgba(56,189,248,${isEmpty?0.06:0.14})`,borderRadius:10,padding:"10px 12px" }}>
+                        <div style={{ fontSize:9,fontWeight:600,letterSpacing:"0.1em",textTransform:"uppercase" as const,color: isEmpty?"#4a5568":"#38bdf8",marginBottom:7,display:"flex",gap:5,alignItems:"center" }}>
+                          <span>{f.icon}</span>{f.label}
+                        </div>
+                        {editingReport ? (
+                          <textarea
+                            value={reportEdits[f.key]??""}
+                            onChange={e => setReportEdits(r=>({...r,[f.key]:e.target.value}))}
+                            rows={f.isArray?3:2}
+                            placeholder={f.isArray?"One item per lineâ€¦":""}
+                            style={{ width:"100%",background:"rgba(8,12,20,0.7)",border:"1px solid rgba(56,189,248,0.12)",borderRadius:6,padding:"7px 9px",fontSize:12,color:"#e8edf5",fontFamily:"'DM Sans',sans-serif",outline:"none",resize:"vertical" as const }}
+                          />
+                        ) : f.isArray ? (
+                          <div style={{ display:"flex",flexWrap:"wrap" as const,gap:4 }}>
+                            {(Array.isArray(val) ? val as string[] : [String(val)]).filter(Boolean).length === 0
+                              ? <span style={{ fontSize:12,color:"#4a5568" }}>â€”</span>
+                              : (Array.isArray(val) ? val as string[] : [String(val)]).filter(Boolean).map((item,i) => (
+                                  <span key={i} style={{ background:"rgba(56,189,248,0.08)",border:"1px solid rgba(56,189,248,0.15)",borderRadius:100,padding:"2px 9px",fontSize:11,color:"#7dd3fc" }}>{item}</span>
+                                ))
+                            }
+                          </div>
+                        ) : (
+                          <div style={{ fontSize:12,color: isEmpty?"#4a5568":"#e8edf5",lineHeight:1.6 }}>
+                            {String(val || "â€”")}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\consultation\[visitId]\page.tsx =====
+// app/consultation/[visitId]/page.tsx
+// âœ… Server Component â€” NO "use client" here
+
+import { prisma } from "@/lib/prisma"
+import { ConsultationForm } from "./Consultationform"
+
+export default async function Consultation({
+  params,
+}: {
+  params: Promise<{ visitId: string }>
+}) {
+  const { visitId } = await params
+  const visit = await prisma.visit.findUnique({
+    where: { id: visitId },
+    include: { patient: true },
+  })
+
+  if (!visit) {
+    return (
+      <div style={{
+        minHeight: "100vh", background: "#080c14",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        fontFamily: "sans-serif",
+      }}>
+        <div style={{ color: "#f87171", fontSize: 18 }}>Visit not found.</div>
+      </div>
+    )
+  }
+
+  return (
+    <ConsultationForm
+      visitId={visit.id}
+      department={visit.department}
+      patientName={visit.patient.name}
+      patientAge={visit.patient.age}
+    />
+  )
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\dashboard\page.tsx =====
+import { getServerSession } from "next-auth"
+import { authOptions } from "../api/auth/[...nextauth]/route"
+import { redirect } from "next/navigation"
+
+export default async function Dashboard() {
+
+  const session = await getServerSession(authOptions)
+
+  if (!session) {
+    redirect("/login")
+  }
+
+  const role = session.user.role
+
+  if (role === "RECEPTION") {
+    redirect("/reception/register")
+  }
+
+  if (role === "DOCTOR") {
+    redirect("/doctor/dashboard")
+  }
+
+  return (
+    <div>
+      <h1>Dashboard</h1>
+    </div>
+  )
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\doctor\dashboard\page.tsx =====
+import { getServerSession } from "next-auth"
+import { authOptions } from "@/app/api/auth/[...nextauth]/route"
+import { prisma } from "@/lib/prisma"
+import { redirect } from "next/navigation"
+import Link from "next/link"
+
+const DEPT_ICONS: Record<string, string> = {
+  GENERAL_MEDICINE: "ðŸ©º",
+  PEDIATRICS:       "ðŸ‘¶",
+  GYNECOLOGY:       "ðŸŒ¸",
+  ORTHOPEDICS:      "ðŸ¦´",
+  ENT:              "ðŸ‘‚",
+}
+
+export default async function DoctorDashboard() {
+
+  const session = await getServerSession(authOptions)
+  if (!session) redirect("/login")
+  if (session.user.role !== "DOCTOR") redirect("/dashboard")
+
+  const doctor = await prisma.user.findUnique({ where: { id: session.user.id } })
+
+  if (!doctor?.department) {
+    return (
+      <div style={{
+        minHeight: "100vh", background: "#080c14",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        fontFamily: "'DM Sans',sans-serif",
+      }}>
+        <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=Syne:wght@700;800&display=swap');`}</style>
+        <div style={{
+          background: "rgba(13,19,33,0.9)", border: "1px solid rgba(248,113,113,0.25)",
+          borderRadius: 16, padding: "40px 48px", textAlign: "center",
+        }}>
+          <div style={{ fontSize: 40, marginBottom: 16 }}>âš ï¸</div>
+          <div style={{ fontFamily: "'Syne',sans-serif", fontSize: 20, fontWeight: 700, color: "#e8edf5", marginBottom: 8 }}>
+            No Department Assigned
+          </div>
+          <div style={{ fontSize: 14, color: "#8b9ab5" }}>
+            Please contact your administrator to assign a department.
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const visits = await prisma.visit.findMany({
+    where: { department: doctor.department },
+    include: { patient: true },
+    orderBy: { createdAt: "asc" },
+  })
+
+  const deptIcon  = DEPT_ICONS[doctor.department] ?? "ðŸ¥"
+  const deptLabel = doctor.department.replace(/_/g, " ")
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: "#080c14",
+      color: "#e8edf5",
+      fontFamily: "'DM Sans','Segoe UI',sans-serif",
+      backgroundImage:
+        "linear-gradient(rgba(56,189,248,0.03) 1px,transparent 1px)," +
+        "linear-gradient(90deg,rgba(56,189,248,0.03) 1px,transparent 1px)",
+      backgroundSize: "48px 48px",
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&family=Syne:wght@700;800&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body::after {
+          content: '';
+          position: fixed; inset: 0;
+          background: repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.03) 2px,rgba(0,0,0,0.03) 4px);
+          pointer-events: none; z-index: 9999;
+        }
+
+        @keyframes fadeSlideUp { from { opacity:0; transform:translateY(20px); } to { opacity:1; transform:translateY(0); } }
+        @keyframes fadeIn      { from { opacity:0; }                            to { opacity:1; } }
+        @keyframes shimmer     { 0% { background-position:-200% center; }      100% { background-position:200% center; } }
+        @keyframes orbFloat    { 0%,100% { transform:translateY(0); }          50% { transform:translateY(-18px); } }
+        @keyframes pulseDot    { 0%,100% { box-shadow:0 0 4px #34d399; }       50% { box-shadow:0 0 14px #34d399, 0 0 24px rgba(52,211,153,0.3); } }
+        @keyframes rowIn       { from { opacity:0; transform:translateX(-12px); } to { opacity:1; transform:translateX(0); } }
+
+        .visit-row {
+          background: rgba(13,19,33,0.85);
+          border: 1px solid rgba(56,189,248,0.12);
+          border-radius: 14px;
+          padding: 20px 24px;
+          display: flex; align-items: center; justify-content: space-between; gap: 16px;
+          transition: border-color 0.25s, transform 0.25s, box-shadow 0.25s;
+          animation: rowIn 0.4s ease both;
+          position: relative; overflow: hidden;
+        }
+        .visit-row::before {
+          content: '';
+          position: absolute; top: 0; left: 0; bottom: 0; width: 3px;
+          background: linear-gradient(180deg, #38bdf8, #0ea5e9);
+          opacity: 0; transition: opacity 0.25s;
+          border-radius: 3px 0 0 3px;
+        }
+        .visit-row:hover {
+          border-color: rgba(56,189,248,0.35);
+          transform: translateX(4px);
+          box-shadow: 0 12px 40px rgba(0,0,0,0.4);
+        }
+        .visit-row:hover::before { opacity: 1; }
+
+        .consult-btn {
+          background: linear-gradient(135deg, #38bdf8, #0ea5e9);
+          color: #080c14;
+          padding: 10px 20px;
+          border-radius: 9px;
+          text-decoration: none;
+          font-weight: 700;
+          font-size: 13px;
+          font-family: 'DM Sans', sans-serif;
+          white-space: nowrap;
+          transition: all 0.25s;
+          display: inline-flex; align-items: center; gap: 7px;
+          position: relative; overflow: hidden;
+          flex-shrink: 0;
+        }
+        .consult-btn::before {
+          content: '';
+          position: absolute; inset: 0;
+          background: linear-gradient(135deg, rgba(255,255,255,0.2), transparent);
+          opacity: 0; transition: opacity 0.25s;
+        }
+        .consult-btn:hover::before { opacity: 1; }
+        .consult-btn:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 10px 30px rgba(56,189,248,0.3);
+        }
+
+        .stat-card {
+          background: rgba(13,19,33,0.85);
+          border: 1px solid rgba(56,189,248,0.12);
+          border-radius: 14px;
+          padding: 22px 24px;
+          transition: border-color 0.25s, transform 0.25s;
+          animation: fadeSlideUp 0.5s ease both;
+        }
+        .stat-card:hover {
+          border-color: rgba(56,189,248,0.28);
+          transform: translateY(-3px);
+        }
+
+        .queue-badge {
+          display: inline-flex; align-items: center; gap: 6px;
+          background: rgba(56,189,248,0.1);
+          border: 1px solid rgba(56,189,248,0.25);
+          border-radius: 100px;
+          padding: 5px 13px;
+          font-size: 12px; font-weight: 600; color: #38bdf8;
+        }
+
+        .empty-state {
+          text-align: center; padding: 72px 24px;
+          animation: fadeIn 0.6s ease both;
+        }
+      `}</style>
+
+      {/* Ambient orbs */}
+      <div style={{ position:"fixed", width:420, height:420, background:"radial-gradient(circle,rgba(56,189,248,0.07) 0%,transparent 65%)", top:-60, right:"5%", borderRadius:"50%", pointerEvents:"none", animation:"orbFloat 9s ease-in-out infinite", zIndex:0 }} />
+      <div style={{ position:"fixed", width:250, height:250, background:"radial-gradient(circle,rgba(14,165,233,0.05) 0%,transparent 70%)", bottom:60, left:"3%", borderRadius:"50%", pointerEvents:"none", animation:"orbFloat 7s 2s ease-in-out infinite", zIndex:0 }} />
+
+      {/* â”€â”€ Navbar â”€â”€ */}
+      <nav style={{
+        display:"flex", alignItems:"center", justifyContent:"space-between",
+        padding:"18px 40px",
+        background:"rgba(8,12,20,0.9)", backdropFilter:"blur(20px)",
+        borderBottom:"1px solid rgba(56,189,248,0.1)",
+        position:"sticky", top:0, zIndex:100,
+      }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <div style={{
+            width:32, height:32,
+            background:"linear-gradient(135deg,#38bdf8,#0ea5e9)",
+            borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center",
+            fontSize:15, boxShadow:"0 0 16px rgba(56,189,248,0.35)",
+          }}>âš•</div>
+          <span style={{ fontFamily:"'Syne',sans-serif", fontSize:18, fontWeight:700, color:"#e8edf5", letterSpacing:"-0.02em" }}>
+            MediLingua <span style={{ color:"#38bdf8" }}>AI</span>
+          </span>
+        </div>
+
+        <div style={{ display:"flex", alignItems:"center", gap:16 }}>
+          {/* Doctor chip */}
+          <div style={{
+            display:"flex", alignItems:"center", gap:8,
+            background:"rgba(13,19,33,0.9)",
+            border:"1px solid rgba(56,189,248,0.15)",
+            borderRadius:100, padding:"7px 14px",
+          }}>
+            <div style={{
+              width:26, height:26, borderRadius:"50%",
+              background:"linear-gradient(135deg,rgba(56,189,248,0.3),rgba(14,165,233,0.2))",
+              display:"flex", alignItems:"center", justifyContent:"center", fontSize:12,
+            }}>ðŸ‘¨â€âš•ï¸</div>
+            <span style={{ fontSize:13, color:"#e8edf5", fontWeight:500 }}>Dr. {session.user.name ?? "Doctor"}</span>
+          </div>
+
+          {/* Status badge */}
+          <div style={{
+            display:"flex", alignItems:"center", gap:7,
+            background:"rgba(52,211,153,0.08)",
+            border:"1px solid rgba(52,211,153,0.2)",
+            borderRadius:100, padding:"6px 14px",
+          }}>
+            <span style={{ width:6, height:6, background:"#34d399", borderRadius:"50%", display:"inline-block", animation:"pulseDot 2s infinite" }} />
+            <span style={{ fontSize:12, color:"#34d399", fontWeight:500 }}>On Duty</span>
+          </div>
+        </div>
+      </nav>
+
+      {/* â”€â”€ Page body â”€â”€ */}
+      <div style={{ maxWidth: 860, margin: "0 auto", padding: "48px 24px 80px", position: "relative", zIndex: 1 }}>
+
+        {/* Header */}
+        <div style={{ marginBottom: 40, animation: "fadeSlideUp 0.5s ease both" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:14 }}>
+            <div style={{
+              width:44, height:44,
+              background:"rgba(56,189,248,0.1)",
+              border:"1px solid rgba(56,189,248,0.3)",
+              borderRadius:12, display:"flex", alignItems:"center", justifyContent:"center",
+              fontSize:22,
+            }}>{deptIcon}</div>
+            <div>
+              <div style={{ fontSize:11, fontWeight:600, letterSpacing:"0.14em", textTransform:"uppercase", color:"#38bdf8", marginBottom:2 }}>
+                Doctor Dashboard
+              </div>
+              <div style={{ fontFamily:"'Syne',sans-serif", fontSize:"clamp(22px,4vw,32px)", fontWeight:800, letterSpacing:"-0.02em", color:"#e8edf5", lineHeight:1.1 }}>
+                {deptLabel}
+              </div>
+            </div>
+          </div>
+          <p style={{ fontSize:14, color:"#8b9ab5", lineHeight:1.6, maxWidth:500 }}>
+            Patients assigned to your department are listed below. Start a consultation to begin recording and transcription.
+          </p>
+        </div>
+
+        {/* â”€â”€ Stat cards â”€â”€ */}
+        <div style={{
+          display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",
+          gap:16, marginBottom:40,
+        }}>
+          {[
+            { icon:"ðŸ‘¥", label:"Patients Waiting",    val: visits.length,                            delay:"0.05s" },
+            { icon:"âœ…", label:"Seen Today",           val: 0,                                        delay:"0.10s" },
+            { icon:"â±",  label:"Avg. Consult Time",   val: "â€”",                                      delay:"0.15s" },
+            { icon:"ðŸ¥", label:"Department",           val: deptLabel,                               delay:"0.20s", small: true },
+          ].map(s => (
+            <div key={s.label} className="stat-card" style={{ animationDelay: s.delay }}>
+              <div style={{ fontSize:20, marginBottom:10 }}>{s.icon}</div>
+              <div style={{ fontFamily:"'Syne',sans-serif", fontSize: s.small ? 15 : 26, fontWeight:700, color:"#e8edf5", marginBottom:4, lineHeight:1.1 }}>{s.val}</div>
+              <div style={{ fontSize:11, color:"#4a5568", textTransform:"uppercase", letterSpacing:"0.08em" }}>{s.label}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* â”€â”€ Queue header â”€â”€ */}
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:20 }}>
+          <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+            <h2 style={{ fontFamily:"'Syne',sans-serif", fontSize:18, fontWeight:700, color:"#e8edf5" }}>
+              Patient Queue
+            </h2>
+            {visits.length > 0 && (
+              <span className="queue-badge">
+                <span style={{ width:5, height:5, background:"#38bdf8", borderRadius:"50%", display:"inline-block" }} />
+                {visits.length} waiting
+              </span>
+            )}
+          </div>
+          <div style={{ fontSize:12, color:"#4a5568" }}>Ordered by arrival time</div>
+        </div>
+
+        {/* â”€â”€ Visit list â”€â”€ */}
+        {visits.length === 0 ? (
+          <div className="empty-state" style={{
+            background:"rgba(13,19,33,0.7)",
+            border:"1px solid rgba(56,189,248,0.1)",
+            borderRadius:20,
+          }}>
+            <div style={{ fontSize:52, marginBottom:16 }}>ðŸŽ‰</div>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontSize:20, fontWeight:700, color:"#e8edf5", marginBottom:8 }}>All clear!</div>
+            <div style={{ fontSize:14, color:"#8b9ab5" }}>No patients waiting in {deptLabel} right now.</div>
+          </div>
+        ) : (
+          <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+            {visits.map((visit, i) => (
+              <div
+                key={visit.id}
+                className="visit-row"
+                style={{ animationDelay: `${0.05 + i * 0.06}s` }}
+              >
+                {/* Queue position */}
+                <div style={{
+                  width:36, height:36, borderRadius:"50%", flexShrink:0,
+                  background: i === 0 ? "linear-gradient(135deg,#38bdf8,#0ea5e9)" : "rgba(56,189,248,0.08)",
+                  border: i === 0 ? "none" : "1px solid rgba(56,189,248,0.2)",
+                  display:"flex", alignItems:"center", justifyContent:"center",
+                  fontFamily:"'Syne',sans-serif", fontWeight:700, fontSize:14,
+                  color: i === 0 ? "#080c14" : "#8b9ab5",
+                  boxShadow: i === 0 ? "0 0 16px rgba(56,189,248,0.35)" : "none",
+                }}>{i + 1}</div>
+
+                {/* Patient info */}
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:4 }}>
+                    <span style={{ fontFamily:"'Syne',sans-serif", fontSize:16, fontWeight:700, color:"#e8edf5" }}>
+                      {visit.patient.name}
+                    </span>
+                    {i === 0 && (
+                      <span style={{
+                        fontSize:10, fontWeight:700, letterSpacing:"0.1em",
+                        background:"rgba(56,189,248,0.15)",
+                        border:"1px solid rgba(56,189,248,0.3)",
+                        color:"#38bdf8", borderRadius:100, padding:"2px 9px",
+                        textTransform:"uppercase",
+                      }}>Next</span>
+                    )}
+                  </div>
+                  <div style={{ display:"flex", gap:16, flexWrap:"wrap" }}>
+                    <span style={{ fontSize:13, color:"#8b9ab5" }}>
+                      Age <span style={{ color:"#e8edf5", fontWeight:500 }}>{visit.patient.age}</span>
+                    </span>
+                    {(visit.patient as { gender?: string }).gender && (
+                      <span style={{ fontSize:13, color:"#8b9ab5" }}>
+                        {(visit.patient as { gender?: string }).gender}
+                      </span>
+                    )}
+                    {(visit.patient as { phone?: string }).phone && (
+                      <span style={{ fontSize:13, color:"#8b9ab5" }}>
+                        ðŸ“± {(visit.patient as { phone?: string }).phone}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Consult CTA */}
+                <Link href={`/consultation/${visit.id}`} className="consult-btn">
+                  {i === 0 ? "â–¶ Start" : "Start"} Consultation
+                  <span style={{ fontSize:15 }}>â†’</span>
+                </Link>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Footer note */}
+        <p style={{ textAlign:"center", fontSize:12, color:"#4a5568", marginTop:36 }}>
+          MediLingua AI Â· Secure & Encrypted Â· Â© 2026
+        </p>
+      </div>
+    </div>
+  )
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\login\page.tsx =====
+"use client"
+
+import { signIn } from "next-auth/react"
+import { useState, useRef, useEffect } from "react"
+import Link from "next/link"
+
+/* â”€â”€ Particle canvas (same as homepage) â”€â”€ */
+function ParticleCanvas() {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  useEffect(() => {
+    const canvas = canvasRef.current!
+    const ctx = canvas.getContext("2d")!
+    let W = (canvas.width = canvas.offsetWidth)
+    let H = (canvas.height = canvas.offsetHeight)
+    const N = 38
+    const particles = Array.from({ length: N }, () => ({
+      x: Math.random() * W, y: Math.random() * H,
+      vx: (Math.random() - 0.5) * 0.35, vy: (Math.random() - 0.5) * 0.35,
+      r: Math.random() * 1.4 + 0.4,
+    }))
+    let raf: number
+    const draw = () => {
+      ctx.clearRect(0, 0, W, H)
+      for (let i = 0; i < N; i++) {
+        const p = particles[i]
+        p.x += p.vx; p.y += p.vy
+        if (p.x < 0 || p.x > W) p.vx *= -1
+        if (p.y < 0 || p.y > H) p.vy *= -1
+        ctx.beginPath()
+        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2)
+        ctx.fillStyle = "rgba(56,189,248,0.5)"
+        ctx.fill()
+        for (let j = i + 1; j < N; j++) {
+          const q = particles[j]
+          const dx = p.x - q.x, dy = p.y - q.y
+          const d = Math.sqrt(dx * dx + dy * dy)
+          if (d < 120) {
+            ctx.beginPath()
+            ctx.moveTo(p.x, p.y)
+            ctx.lineTo(q.x, q.y)
+            ctx.strokeStyle = `rgba(56,189,248,${0.15 * (1 - d / 120)})`
+            ctx.lineWidth = 0.5
+            ctx.stroke()
+          }
+        }
+      }
+      raf = requestAnimationFrame(draw)
+    }
+    draw()
+    const resize = () => { W = canvas.width = canvas.offsetWidth; H = canvas.height = canvas.offsetHeight }
+    window.addEventListener("resize", resize)
+    return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", resize) }
+  }, [])
+  return <canvas ref={canvasRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0.45, pointerEvents: "none" }} />
+}
+
+export default function LoginPage() {
+  const [email, setEmail] = useState("")
+  const [password, setPassword] = useState("")
+  const [loading, setLoading] = useState(false)
+  const [showPass, setShowPass] = useState(false)
+  const [focused, setFocused] = useState<string | null>(null)
+  const [shake, setShake] = useState(false)
+
+  const handleLogin = async () => {
+    if (!email || !password) {
+      setShake(true)
+      setTimeout(() => setShake(false), 500)
+      return
+    }
+    setLoading(true)
+    await signIn("credentials", {
+      email,
+      password,
+      redirect: true,
+      callbackUrl: "/dashboard",
+    })
+    setLoading(false)
+  }
+
+  const handleKey = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter") handleLogin()
+  }
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: "#080c14",
+      display: "flex",
+      fontFamily: "'DM Sans','Segoe UI',sans-serif",
+      overflow: "hidden",
+      position: "relative",
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&family=Syne:wght@600;700;800&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+          --accent: #38bdf8;
+          --accent-glow: rgba(56,189,248,0.28);
+          --accent-dim: rgba(56,189,248,0.1);
+          --border: rgba(56,189,248,0.14);
+          --border-hover: rgba(56,189,248,0.38);
+          --bg-card: rgba(13,19,33,0.92);
+          --text-primary: #e8edf5;
+          --text-secondary: #8b9ab5;
+          --text-muted: #4a5568;
+          --success: #34d399;
+          --error: #f87171;
+        }
+
+        body::after {
+          content: '';
+          position: fixed; inset: 0;
+          background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px);
+          pointer-events: none; z-index: 9999;
+        }
+
+        @keyframes fadeSlideUp { from { opacity:0; transform:translateY(24px); } to { opacity:1; transform:translateY(0); } }
+        @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+        @keyframes shimmer { 0% { background-position:-200% center; } 100% { background-position:200% center; } }
+        @keyframes orbFloat { 0%,100% { transform:translateY(0) scale(1); } 50% { transform:translateY(-20px) scale(1.05); } }
+        @keyframes spin { to { transform:rotate(360deg); } }
+        @keyframes shake {
+          0%,100% { transform:translateX(0); }
+          15%,45%,75% { transform:translateX(-6px); }
+          30%,60%,90% { transform:translateX(6px); }
+        }
+        @keyframes pulse {
+          0%,100% { box-shadow:0 0 0 0 rgba(56,189,248,0.4); }
+          50% { box-shadow:0 0 0 8px rgba(56,189,248,0); }
+        }
+        @keyframes borderTrace {
+          0% { stroke-dashoffset: 400; }
+          100% { stroke-dashoffset: 0; }
+        }
+        @keyframes slideInLeft { from { opacity:0; transform:translateX(-40px); } to { opacity:1; transform:translateX(0); } }
+
+        .login-card {
+          animation: fadeSlideUp 0.7s ease both;
+        }
+        .shake { animation: shake 0.45s ease both !important; }
+
+        .input-field {
+          width: 100%;
+          background: rgba(8,12,20,0.8);
+          border: 1px solid var(--border);
+          border-radius: 10px;
+          padding: 13px 16px;
+          font-size: 15px;
+          color: var(--text-primary);
+          font-family: 'DM Sans', sans-serif;
+          outline: none;
+          transition: border-color 0.25s, box-shadow 0.25s, background 0.25s;
+          caret-color: var(--accent);
+        }
+        .input-field::placeholder { color: var(--text-muted); }
+        .input-field:focus {
+          border-color: var(--accent);
+          box-shadow: 0 0 0 3px rgba(56,189,248,0.12), inset 0 0 12px rgba(56,189,248,0.03);
+          background: rgba(12,18,30,0.95);
+        }
+        .input-field:hover:not(:focus) { border-color: rgba(56,189,248,0.25); }
+
+        .login-btn {
+          width: 100%;
+          background: linear-gradient(135deg, #38bdf8, #0ea5e9);
+          color: #080c14;
+          padding: 14px;
+          border-radius: 10px;
+          border: none;
+          font-size: 15px;
+          font-weight: 700;
+          font-family: 'DM Sans', sans-serif;
+          cursor: pointer;
+          transition: all 0.25s;
+          position: relative;
+          overflow: hidden;
+          letter-spacing: 0.02em;
+        }
+        .login-btn::before {
+          content: '';
+          position: absolute; inset: 0;
+          background: linear-gradient(135deg, rgba(255,255,255,0.18), transparent);
+          opacity: 0; transition: opacity 0.25s;
+        }
+        .login-btn:hover::before { opacity: 1; }
+        .login-btn:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 14px 40px var(--accent-glow), 0 0 0 1px rgba(56,189,248,0.3);
+        }
+        .login-btn:active { transform: translateY(0); }
+        .login-btn:disabled { opacity: 0.7; cursor: not-allowed; transform: none; }
+
+        .label {
+          display: block;
+          font-size: 12px;
+          font-weight: 600;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+          color: var(--text-secondary);
+          margin-bottom: 8px;
+        }
+
+        .show-pass-btn {
+          position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+          background: none; border: none; cursor: pointer;
+          color: var(--text-muted); font-size: 13px;
+          transition: color 0.2s; padding: 4px;
+        }
+        .show-pass-btn:hover { color: var(--accent); }
+
+        .divider {
+          display: flex; align-items: center; gap: 12px;
+          color: var(--text-muted); font-size: 12px;
+          margin: 24px 0;
+        }
+        .divider::before, .divider::after {
+          content: ''; flex: 1;
+          height: 1px; background: var(--border);
+        }
+
+        .social-btn {
+          width: 100%;
+          background: transparent;
+          border: 1px solid var(--border);
+          border-radius: 10px;
+          padding: 12px;
+          font-size: 14px;
+          font-family: 'DM Sans', sans-serif;
+          color: var(--text-secondary);
+          cursor: pointer;
+          transition: all 0.25s;
+          display: flex; align-items: center; justify-content: center; gap: 10px;
+        }
+        .social-btn:hover {
+          border-color: var(--border-hover);
+          color: var(--text-primary);
+          background: var(--accent-dim);
+        }
+
+        /* Left panel decorative elements */
+        .deco-ring {
+          position: absolute;
+          border-radius: 50%;
+          border: 1px solid rgba(56,189,248,0.08);
+          animation: orbFloat 8s ease-in-out infinite;
+        }
+
+        .feature-item {
+          display: flex; align-items: flex-start; gap: 14px;
+          animation: slideInLeft 0.6s ease both;
+        }
+        .feature-icon-wrap {
+          width: 38px; height: 38px; flex-shrink: 0;
+          background: var(--accent-dim);
+          border: 1px solid var(--border-hover);
+          border-radius: 10px;
+          display: flex; align-items: center; justify-content: center;
+          font-size: 17px;
+        }
+
+        .spinner {
+          width: 18px; height: 18px;
+          border: 2px solid rgba(8,12,20,0.3);
+          border-top-color: #080c14;
+          border-radius: 50%;
+          animation: spin 0.7s linear infinite;
+          display: inline-block;
+        }
+      `}</style>
+
+      {/* â”€â”€ Background particle canvas â”€â”€ */}
+      <ParticleCanvas />
+
+      {/* â”€â”€ Ambient orbs â”€â”€ */}
+      <div style={{ position:"absolute", width:500, height:500, background:"radial-gradient(circle,rgba(56,189,248,0.07) 0%,transparent 65%)", top:-80, left:"30%", borderRadius:"50%", pointerEvents:"none", animation:"orbFloat 9s ease-in-out infinite" }} />
+      <div style={{ position:"absolute", width:300, height:300, background:"radial-gradient(circle,rgba(14,165,233,0.06) 0%,transparent 70%)", bottom:60, right:"10%", borderRadius:"50%", pointerEvents:"none", animation:"orbFloat 7s 3s ease-in-out infinite" }} />
+
+      {/* Grid bg */}
+      <div style={{
+        position:"absolute", inset:0, pointerEvents:"none",
+        backgroundImage:"linear-gradient(rgba(56,189,248,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(56,189,248,0.03) 1px,transparent 1px)",
+        backgroundSize:"48px 48px",
+      }} />
+
+      {/* â•â• LEFT PANEL â•â• */}
+      <div style={{
+        flex: 1, display:"flex", flexDirection:"column",
+        justifyContent:"center", padding:"60px 64px",
+        position:"relative", zIndex:1,
+        borderRight:"1px solid var(--border)",
+      }} className="hide-mobile">
+
+        {/* Decorative rings */}
+        <div className="deco-ring" style={{ width:320, height:320, top:-80, right:-80, animationDelay:"0s" }} />
+        <div className="deco-ring" style={{ width:180, height:180, bottom:100, left:-40, animationDelay:"-3s" }} />
+
+        {/* Logo */}
+        <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:64 }}>
+          <div style={{
+            width:38, height:38,
+            background:"linear-gradient(135deg,#38bdf8,#0ea5e9)",
+            borderRadius:10, display:"flex", alignItems:"center", justifyContent:"center",
+            fontSize:18, boxShadow:"0 0 20px rgba(56,189,248,0.4)",
+          }}>âš•</div>
+          <span style={{ fontFamily:"'Syne',sans-serif", fontSize:22, fontWeight:700, color:"var(--text-primary)", letterSpacing:"-0.02em" }}>
+            MediLingua <span style={{ color:"var(--accent)" }}>AI</span>
+          </span>
+        </div>
+
+        <div style={{ marginBottom:48 }}>
+          <div style={{ fontFamily:"'Syne',sans-serif", fontSize:"clamp(28px,3vw,42px)", fontWeight:800, lineHeight:1.1, letterSpacing:"-0.03em", color:"var(--text-primary)", marginBottom:16 }}>
+            Smarter OPD.<br />
+            <span style={{
+              background:"linear-gradient(90deg,#38bdf8,#7dd3fc,#38bdf8)",
+              backgroundSize:"200% auto",
+              WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent",
+              backgroundClip:"text",
+              animation:"shimmer 3s linear infinite",
+            }}>Zero Paperwork.</span>
+          </div>
+          <p style={{ fontSize:15, lineHeight:1.7, color:"var(--text-secondary)", maxWidth:380 }}>
+            AI-powered transcription and report generation for high-volume Indian hospitals.
+          </p>
+        </div>
+
+        {/* Feature list */}
+        <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+          {[
+            { icon:"ðŸŽ™", title:"Multilingual transcription", sub:"Hindi, Kannada & English", delay:"0.1s" },
+            { icon:"ðŸ“‹", title:"Instant SOAP reports", sub:"Structured in under 30 seconds", delay:"0.2s" },
+            { icon:"ðŸ—‚", title:"Patient history at a glance", sub:"Full longitudinal OPD records", delay:"0.3s" },
+          ].map(f => (
+            <div key={f.title} className="feature-item" style={{ animationDelay: f.delay }}>
+              <div className="feature-icon-wrap">{f.icon}</div>
+              <div>
+                <div style={{ fontSize:14, fontWeight:600, color:"var(--text-primary)", marginBottom:2 }}>{f.title}</div>
+                <div style={{ fontSize:13, color:"var(--text-muted)" }}>{f.sub}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Bottom badge */}
+        <div style={{
+          marginTop:56,
+          display:"inline-flex", alignItems:"center", gap:8,
+          background:"rgba(52,211,153,0.08)",
+          border:"1px solid rgba(52,211,153,0.2)",
+          borderRadius:100, padding:"7px 16px",
+          width:"fit-content",
+        }}>
+          <span style={{ width:7, height:7, background:"#34d399", borderRadius:"50%", display:"inline-block", boxShadow:"0 0 8px #34d399" }} />
+          <span style={{ fontSize:12, color:"#34d399", fontWeight:500 }}>All systems operational</span>
+        </div>
+      </div>
+
+      {/* â•â• RIGHT PANEL â€” Login Form â•â• */}
+      <div style={{
+        width:"min(100%, 480px)",
+        display:"flex", flexDirection:"column",
+        justifyContent:"center", alignItems:"center",
+        padding:"48px 40px",
+        position:"relative", zIndex:1,
+      }}>
+        <div
+          className={`login-card${shake ? " shake" : ""}`}
+          style={{ width:"100%", maxWidth:400 }}
+        >
+          {/* Card header */}
+          <div style={{ marginBottom:36 }}>
+            {/* Mobile logo */}
+            <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:32 }}>
+              <div style={{
+                width:30, height:30,
+                background:"linear-gradient(135deg,#38bdf8,#0ea5e9)",
+                borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center",
+                fontSize:14, boxShadow:"0 0 14px rgba(56,189,248,0.35)",
+              }}>âš•</div>
+              <span style={{ fontFamily:"'Syne',sans-serif", fontSize:16, fontWeight:700, color:"var(--text-primary)" }}>
+                MediLingua <span style={{ color:"var(--accent)" }}>AI</span>
+              </span>
+            </div>
+
+            <h1 style={{ fontFamily:"'Syne',sans-serif", fontSize:28, fontWeight:800, color:"var(--text-primary)", letterSpacing:"-0.02em", marginBottom:8 }}>
+              Welcome back
+            </h1>
+            <p style={{ fontSize:14, color:"var(--text-secondary)" }}>
+              Sign in to your MediLingua workspace
+            </p>
+          </div>
+
+          {/* Card body */}
+          <div style={{
+            background:"var(--bg-card)",
+            border:"1px solid var(--border)",
+            borderRadius:18,
+            padding:"32px 28px",
+            backdropFilter:"blur(20px)",
+            boxShadow:"0 24px 64px rgba(0,0,0,0.5), inset 0 1px 0 rgba(56,189,248,0.06)",
+          }}>
+
+            {/* Email */}
+            <div style={{ marginBottom:20 }}>
+              <label className="label">Email address</label>
+              <div style={{ position:"relative" }}>
+                <input
+                  className="input-field"
+                  placeholder="doctor@hospital.in"
+                  type="email"
+                  value={email}
+                  onChange={e => setEmail(e.target.value)}
+                  onKeyDown={handleKey}
+                  onFocus={() => setFocused("email")}
+                  onBlur={() => setFocused(null)}
+                  style={{ paddingLeft: 42 }}
+                />
+                <span style={{
+                  position:"absolute", left:14, top:"50%", transform:"translateY(-50%)",
+                  fontSize:15, opacity: focused === "email" ? 1 : 0.45,
+                  transition:"opacity 0.2s",
+                }}>âœ‰</span>
+              </div>
+            </div>
+
+            {/* Password */}
+            <div style={{ marginBottom:12 }}>
+              <label className="label">Password</label>
+              <div style={{ position:"relative" }}>
+                <input
+                  className="input-field"
+                  placeholder="â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢"
+                  type={showPass ? "text" : "password"}
+                  value={password}
+                  onChange={e => setPassword(e.target.value)}
+                  onKeyDown={handleKey}
+                  onFocus={() => setFocused("password")}
+                  onBlur={() => setFocused(null)}
+                  style={{ paddingLeft:42, paddingRight:52 }}
+                />
+                <span style={{
+                  position:"absolute", left:14, top:"50%", transform:"translateY(-50%)",
+                  fontSize:15, opacity: focused === "password" ? 1 : 0.45,
+                  transition:"opacity 0.2s",
+                }}>ðŸ”’</span>
+                <button className="show-pass-btn" onClick={() => setShowPass(s => !s)} type="button">
+                  {showPass ? "Hide" : "Show"}
+                </button>
+              </div>
+            </div>
+
+            {/* Forgot */}
+            <div style={{ textAlign:"right", marginBottom:28 }}>
+              <a href="#" style={{ fontSize:13, color:"var(--accent)", textDecoration:"none", opacity:0.8, transition:"opacity 0.2s" }}
+                onMouseEnter={e => (e.currentTarget.style.opacity="1")}
+                onMouseLeave={e => (e.currentTarget.style.opacity="0.8")}
+              >Forgot password?</a>
+            </div>
+
+            {/* Login button */}
+            <button className="login-btn" onClick={handleLogin} disabled={loading}>
+              {loading ? (
+                <span style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:10 }}>
+                  <span className="spinner" />
+                  Signing inâ€¦
+                </span>
+              ) : "Sign In â†’"}
+            </button>
+
+           
+
+           
+          </div>
+
+          {/* Footer */}
+          <p style={{ textAlign:"center", fontSize:13, color:"var(--text-muted)", marginTop:24 }}>
+            Don't have an account?{" "}
+            <Link href="/register" style={{ color:"var(--accent)", textDecoration:"none", fontWeight:500 }}>
+              Request access â†’
+            </Link>
+          </p>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\reception\register\page.tsx =====
+"use client"
+
+import { useState } from "react"
+
+const DEPARTMENTS = [
+  { value: "GENERAL_MEDICINE", label: "General Medicine", icon: "ðŸ©º" },
+  { value: "PEDIATRICS",       label: "Pediatrics",       icon: "ðŸ‘¶" },
+  { value: "GYNECOLOGY",       label: "Gynecology",       icon: "ðŸŒ¸" },
+  { value: "ORTHOPEDICS",      label: "Orthopedics",      icon: "ðŸ¦´" },
+  { value: "ENT",              label: "ENT",              icon: "ðŸ‘‚" },
+]
+
+export default function RegisterPatient() {
+  const [name,       setName]       = useState("")
+  const [age,        setAge]        = useState("")
+  const [gender,     setGender]     = useState("Male")
+  const [phone,      setPhone]      = useState("")
+  const [department, setDepartment] = useState("GENERAL_MEDICINE")
+  const [loading,    setLoading]    = useState(false)
+  const [success,    setSuccess]    = useState(false)
+  const [focused,    setFocused]    = useState<string | null>(null)
+  const [errors,     setErrors]     = useState<Record<string, string>>({})
+
+  const validate = () => {
+    const e: Record<string, string> = {}
+    if (!name.trim())               e.name  = "Patient name is required"
+    if (!age || isNaN(Number(age)) || Number(age) < 0 || Number(age) > 130)
+                                    e.age   = "Enter a valid age (0â€“130)"
+    if (!phone.trim() || phone.replace(/\D/g,"").length < 10)
+                                    e.phone = "Enter a valid 10-digit phone number"
+    setErrors(e)
+    return Object.keys(e).length === 0
+  }
+
+  const handleSubmit = async () => {
+    if (!validate()) return
+    setLoading(true)
+    try {
+      await fetch("/api/patient", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, age: Number(age), gender, phone, department }),
+      })
+      setSuccess(true)
+      setTimeout(() => setSuccess(false), 3500)
+      setName(""); setAge(""); setGender("Male"); setPhone(""); setDepartment("GENERAL_MEDICINE")
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const inputStyle = (field: string): React.CSSProperties => ({
+    width: "100%",
+    background: "rgba(8,12,20,0.8)",
+    border: `1px solid ${errors[field] ? "rgba(248,113,113,0.5)" : focused === field ? "rgba(56,189,248,0.6)" : "rgba(56,189,248,0.14)"}`,
+    borderRadius: 10,
+    padding: "13px 16px 13px 44px",
+    fontSize: 15,
+    color: "#e8edf5",
+    fontFamily: "'DM Sans', sans-serif",
+    outline: "none",
+    transition: "border-color 0.25s, box-shadow 0.25s",
+    boxShadow: focused === field ? "0 0 0 3px rgba(56,189,248,0.1)" : "none",
+    caretColor: "#38bdf8",
+  })
+
+  const selectStyle = (field: string): React.CSSProperties => ({
+    width: "100%",
+    background: "rgba(8,12,20,0.9)",
+    border: `1px solid ${focused === field ? "rgba(56,189,248,0.6)" : "rgba(56,189,248,0.14)"}`,
+    borderRadius: 10,
+    padding: "13px 16px 13px 44px",
+    fontSize: 15,
+    color: "#e8edf5",
+    fontFamily: "'DM Sans', sans-serif",
+    outline: "none",
+    appearance: "none" as const,
+    cursor: "pointer",
+    transition: "border-color 0.25s, box-shadow 0.25s",
+    boxShadow: focused === field ? "0 0 0 3px rgba(56,189,248,0.1)" : "none",
+  })
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: "#080c14",
+      color: "#e8edf5",
+      fontFamily: "'DM Sans','Segoe UI',sans-serif",
+      backgroundImage: "linear-gradient(rgba(56,189,248,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(56,189,248,0.03) 1px,transparent 1px)",
+      backgroundSize: "48px 48px",
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&family=Syne:wght@700;800&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        ::placeholder { color: #4a5568 !important; }
+        option { background: #0d1321; color: #e8edf5; }
+
+        body::after {
+          content: '';
+          position: fixed; inset: 0;
+          background: repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.03) 2px,rgba(0,0,0,0.03) 4px);
+          pointer-events: none; z-index: 9999;
+        }
+
+        @keyframes fadeSlideUp { from { opacity:0; transform:translateY(24px); } to { opacity:1; transform:translateY(0); } }
+        @keyframes shimmer { 0% { background-position:-200% center; } 100% { background-position:200% center; } }
+        @keyframes spin { to { transform:rotate(360deg); } }
+        @keyframes successPop {
+          0%   { opacity:0; transform:scale(0.85) translateY(8px); }
+          60%  { transform:scale(1.03) translateY(-2px); }
+          100% { opacity:1; transform:scale(1) translateY(0); }
+        }
+        @keyframes slideDown { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:translateY(0); } }
+        @keyframes orbFloat { 0%,100% { transform:translateY(0); } 50% { transform:translateY(-16px); } }
+
+        .field-row { animation: fadeSlideUp 0.5s ease both; }
+        .field-row:nth-child(1) { animation-delay: 0.05s; }
+        .field-row:nth-child(2) { animation-delay: 0.10s; }
+        .field-row:nth-child(3) { animation-delay: 0.15s; }
+        .field-row:nth-child(4) { animation-delay: 0.20s; }
+        .field-row:nth-child(5) { animation-delay: 0.25s; }
+
+        .submit-btn {
+          width: 100%;
+          background: linear-gradient(135deg,#38bdf8,#0ea5e9);
+          color: #080c14;
+          padding: 14px;
+          border-radius: 10px;
+          border: none;
+          font-size: 15px; font-weight: 700;
+          font-family: 'DM Sans', sans-serif;
+          cursor: pointer;
+          transition: all 0.25s;
+          position: relative; overflow: hidden;
+          letter-spacing: 0.02em;
+        }
+        .submit-btn::before {
+          content: '';
+          position: absolute; inset: 0;
+          background: linear-gradient(135deg,rgba(255,255,255,0.18),transparent);
+          opacity: 0; transition: opacity 0.25s;
+        }
+        .submit-btn:hover::before { opacity: 1; }
+        .submit-btn:hover:not(:disabled) {
+          transform: translateY(-2px);
+          box-shadow: 0 14px 40px rgba(56,189,248,0.28), 0 0 0 1px rgba(56,189,248,0.3);
+        }
+        .submit-btn:disabled { opacity: 0.65; cursor: not-allowed; }
+
+        .gender-btn {
+          flex: 1; padding: 11px 16px;
+          border-radius: 9px;
+          border: 1px solid rgba(56,189,248,0.14);
+          background: rgba(8,12,20,0.8);
+          color: #8b9ab5;
+          font-family: 'DM Sans', sans-serif;
+          font-size: 14px; font-weight: 500;
+          cursor: pointer;
+          transition: all 0.2s;
+          display: flex; align-items: center; justify-content: center; gap: 7px;
+        }
+        .gender-btn.active {
+          border-color: rgba(56,189,248,0.5);
+          background: rgba(56,189,248,0.1);
+          color: #38bdf8;
+          box-shadow: 0 0 0 3px rgba(56,189,248,0.08);
+        }
+        .gender-btn:hover:not(.active) {
+          border-color: rgba(56,189,248,0.28);
+          color: #e8edf5;
+        }
+
+        .dept-chip {
+          padding: 9px 16px;
+          border-radius: 8px;
+          border: 1px solid rgba(56,189,248,0.14);
+          background: rgba(8,12,20,0.8);
+          color: #8b9ab5;
+          font-family: 'DM Sans', sans-serif;
+          font-size: 13px; font-weight: 500;
+          cursor: pointer;
+          transition: all 0.2s;
+          display: flex; align-items: center; gap: 6px;
+          white-space: nowrap;
+        }
+        .dept-chip.active {
+          border-color: rgba(56,189,248,0.5);
+          background: rgba(56,189,248,0.1);
+          color: #38bdf8;
+        }
+        .dept-chip:hover:not(.active) { border-color: rgba(56,189,248,0.25); color: #e8edf5; }
+
+        .error-msg { font-size:12px; color:#f87171; margin-top:6px; animation:slideDown 0.2s ease; }
+        .label { display:block; font-size:11px; font-weight:600; letter-spacing:0.09em; text-transform:uppercase; color:#8b9ab5; margin-bottom:8px; }
+        .spinner { width:17px; height:17px; border:2px solid rgba(8,12,20,0.3); border-top-color:#080c14; border-radius:50%; animation:spin 0.7s linear infinite; display:inline-block; }
+      `}</style>
+
+      {/* Ambient orbs */}
+      <div style={{ position:"fixed", width:440, height:440, background:"radial-gradient(circle,rgba(56,189,248,0.07) 0%,transparent 65%)", top:-60, right:"5%", borderRadius:"50%", pointerEvents:"none", animation:"orbFloat 9s ease-in-out infinite", zIndex:0 }} />
+      <div style={{ position:"fixed", width:260, height:260, background:"radial-gradient(circle,rgba(14,165,233,0.05) 0%,transparent 70%)", bottom:80, left:"3%", borderRadius:"50%", pointerEvents:"none", animation:"orbFloat 7s 2s ease-in-out infinite", zIndex:0 }} />
+
+      {/* â”€â”€ Topbar â”€â”€ */}
+      <nav style={{
+        display:"flex", alignItems:"center", justifyContent:"space-between",
+        padding:"18px 40px",
+        background:"rgba(8,12,20,0.9)", backdropFilter:"blur(20px)",
+        borderBottom:"1px solid rgba(56,189,248,0.1)",
+        position:"sticky", top:0, zIndex:100,
+      }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <div style={{
+            width:32, height:32,
+            background:"linear-gradient(135deg,#38bdf8,#0ea5e9)",
+            borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center",
+            fontSize:15, boxShadow:"0 0 16px rgba(56,189,248,0.35)",
+          }}>âš•</div>
+          <span style={{ fontFamily:"'Syne',sans-serif", fontSize:18, fontWeight:700, color:"#e8edf5", letterSpacing:"-0.02em" }}>
+            MediLingua <span style={{ color:"#38bdf8" }}>AI</span>
+          </span>
+        </div>
+        <div style={{
+          display:"flex", alignItems:"center", gap:8,
+          background:"rgba(52,211,153,0.08)",
+          border:"1px solid rgba(52,211,153,0.2)",
+          borderRadius:100, padding:"6px 14px",
+        }}>
+          <span style={{ width:6, height:6, background:"#34d399", borderRadius:"50%", display:"inline-block", boxShadow:"0 0 6px #34d399" }} />
+          <span style={{ fontSize:12, color:"#34d399", fontWeight:500 }}>Reception â€” OPD</span>
+        </div>
+      </nav>
+
+      {/* â”€â”€ Page content â”€â”€ */}
+      <div style={{ maxWidth:720, margin:"0 auto", padding:"48px 24px 80px", position:"relative", zIndex:1 }}>
+
+        {/* Page header */}
+        <div style={{ marginBottom:40, animation:"fadeSlideUp 0.5s ease both" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:12 }}>
+            <div style={{
+              width:40, height:40,
+              background:"rgba(56,189,248,0.1)",
+              border:"1px solid rgba(56,189,248,0.3)",
+              borderRadius:10, display:"flex", alignItems:"center", justifyContent:"center",
+              fontSize:18,
+            }}>ðŸ¥</div>
+            <span style={{ fontSize:11, fontWeight:600, letterSpacing:"0.14em", textTransform:"uppercase", color:"#38bdf8" }}>Patient Registration</span>
+          </div>
+          <h1 style={{ fontFamily:"'Syne',sans-serif", fontSize:"clamp(24px,4vw,34px)", fontWeight:800, letterSpacing:"-0.02em", color:"#e8edf5", lineHeight:1.1, marginBottom:10 }}>
+            Register New Patient
+          </h1>
+          <p style={{ fontSize:14, color:"#8b9ab5", lineHeight:1.6 }}>
+            Fill in the details below to register a new patient and assign them to a department.
+          </p>
+        </div>
+
+        {/* â”€â”€ Success toast â”€â”€ */}
+        {success && (
+          <div style={{
+            background:"rgba(52,211,153,0.1)",
+            border:"1px solid rgba(52,211,153,0.35)",
+            borderRadius:12, padding:"16px 20px",
+            display:"flex", alignItems:"center", gap:12,
+            marginBottom:28, animation:"successPop 0.4s ease both",
+          }}>
+            <span style={{ fontSize:20 }}>âœ…</span>
+            <div>
+              <div style={{ fontWeight:600, color:"#34d399", fontSize:14, marginBottom:2 }}>Patient registered successfully</div>
+              <div style={{ fontSize:13, color:"#8b9ab5" }}>The patient has been added to the OPD queue.</div>
+            </div>
+          </div>
+        )}
+
+        {/* â”€â”€ Form card â”€â”€ */}
+        <div style={{
+          background:"rgba(13,19,33,0.9)",
+          border:"1px solid rgba(56,189,248,0.12)",
+          borderRadius:20,
+          padding:"36px 32px",
+          backdropFilter:"blur(20px)",
+          boxShadow:"0 24px 64px rgba(0,0,0,0.5), inset 0 1px 0 rgba(56,189,248,0.06)",
+        }}>
+
+          <div style={{ display:"flex", flexDirection:"column", gap:24 }}>
+
+            {/* Name */}
+            <div className="field-row">
+              <label className="label">Full Name</label>
+              <div style={{ position:"relative" }}>
+                <input
+                  style={inputStyle("name")}
+                  placeholder="e.g. Ravi Kumar"
+                  value={name}
+                  onChange={e => setName(e.target.value)}
+                  onFocus={() => setFocused("name")}
+                  onBlur={() => setFocused(null)}
+                />
+                <span style={{ position:"absolute", left:14, top:"50%", transform:"translateY(-50%)", fontSize:16, opacity: focused==="name" ? 1 : 0.4, transition:"opacity 0.2s" }}>ðŸ‘¤</span>
+              </div>
+              {errors.name && <div className="error-msg">âš  {errors.name}</div>}
+            </div>
+
+            {/* Age + Gender side by side */}
+            <div className="field-row" style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:20 }}>
+
+              {/* Age */}
+              <div>
+                <label className="label">Age</label>
+                <div style={{ position:"relative" }}>
+                  <input
+                    style={inputStyle("age")}
+                    placeholder="e.g. 34"
+                    type="number"
+                    min={0} max={130}
+                    value={age}
+                    onChange={e => setAge(e.target.value)}
+                    onFocus={() => setFocused("age")}
+                    onBlur={() => setFocused(null)}
+                  />
+                  <span style={{ position:"absolute", left:14, top:"50%", transform:"translateY(-50%)", fontSize:16, opacity: focused==="age" ? 1 : 0.4, transition:"opacity 0.2s" }}>ðŸŽ‚</span>
+                </div>
+                {errors.age && <div className="error-msg">âš  {errors.age}</div>}
+              </div>
+
+              {/* Gender */}
+              <div>
+                <label className="label">Gender</label>
+                <div style={{ display:"flex", gap:8 }}>
+                  {[{ label:"â™‚ Male", val:"Male" }, { label:"â™€ Female", val:"Female" }].map(g => (
+                    <button
+                      key={g.val}
+                      className={`gender-btn${gender === g.val ? " active" : ""}`}
+                      onClick={() => setGender(g.val)}
+                      type="button"
+                    >{g.label}</button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Phone */}
+            <div className="field-row">
+              <label className="label">Phone Number</label>
+              <div style={{ position:"relative" }}>
+                <input
+                  style={inputStyle("phone")}
+                  placeholder="e.g. 9876543210"
+                  type="tel"
+                  value={phone}
+                  onChange={e => setPhone(e.target.value)}
+                  onFocus={() => setFocused("phone")}
+                  onBlur={() => setFocused(null)}
+                />
+                <span style={{ position:"absolute", left:14, top:"50%", transform:"translateY(-50%)", fontSize:16, opacity: focused==="phone" ? 1 : 0.4, transition:"opacity 0.2s" }}>ðŸ“±</span>
+              </div>
+              {errors.phone && <div className="error-msg">âš  {errors.phone}</div>}
+            </div>
+
+            {/* Department */}
+            <div className="field-row">
+              <label className="label">Department</label>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:10, marginTop:2 }}>
+                {DEPARTMENTS.map(d => (
+                  <button
+                    key={d.value}
+                    className={`dept-chip${department === d.value ? " active" : ""}`}
+                    onClick={() => setDepartment(d.value)}
+                    type="button"
+                  >
+                    <span>{d.icon}</span> {d.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Divider */}
+            <div style={{ borderTop:"1px solid rgba(56,189,248,0.08)", margin:"4px 0" }} />
+
+            {/* Summary preview */}
+            {(name || age || phone) && (
+              <div style={{
+                background:"rgba(56,189,248,0.05)",
+                border:"1px solid rgba(56,189,248,0.12)",
+                borderRadius:12, padding:"16px 18px",
+                animation:"slideDown 0.3s ease",
+              }}>
+                <div style={{ fontSize:11, fontWeight:600, letterSpacing:"0.1em", textTransform:"uppercase", color:"#38bdf8", marginBottom:10 }}>Preview</div>
+                <div style={{ display:"flex", flexWrap:"wrap", gap:"8px 28px" }}>
+                  {[
+                    { label:"Name",  val: name      || "â€”" },
+                    { label:"Age",   val: age ? `${age} yrs` : "â€”" },
+                    { label:"Gender",val: gender },
+                    { label:"Phone", val: phone     || "â€”" },
+                    { label:"Dept",  val: DEPARTMENTS.find(d=>d.value===department)?.label || department },
+                  ].map(r => (
+                    <div key={r.label}>
+                      <div style={{ fontSize:11, color:"#4a5568", textTransform:"uppercase", letterSpacing:"0.07em" }}>{r.label}</div>
+                      <div style={{ fontSize:14, color:"#e8edf5", fontWeight:500, marginTop:2 }}>{r.val}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Submit */}
+            <button className="submit-btn" onClick={handleSubmit} disabled={loading} style={{ marginTop:4 }}>
+              {loading ? (
+                <span style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:10 }}>
+                  <span className="spinner" /> Registering patientâ€¦
+                </span>
+              ) : "Register Patient â†’"}
+            </button>
+
+          </div>
+        </div>
+
+        {/* Footer note */}
+        <p style={{ textAlign:"center", fontSize:12, color:"#4a5568", marginTop:24 }}>
+          Patient data is encrypted and stored securely Â· MediLingua AI Â© 2026
+        </p>
+      </div>
+    </div>
+  )
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\globals.css =====
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\layout.tsx =====
+import type { Metadata } from "next";
+import { Geist, Geist_Mono } from "next/font/google";
+import "./globals.css";
+
+const geistSans = Geist({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
+});
+
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
+  subsets: ["latin"],
+});
+
+export const metadata: Metadata = {
+  title: "Create Next App",
+  description: "Generated by create next app",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="en">
+      <body
+        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
+      >
+        {children}
+      </body>
+    </html>
+  );
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\app\page.tsx =====
+"use client"
+import Link from "next/link"
+import { useEffect, useRef, useState } from "react"
+
+/* â”€â”€ Animated counter hook â”€â”€ */
+function useCounter(target: number, duration = 2000, start = false) {
+  const [value, setValue] = useState(0)
+  useEffect(() => {
+    if (!start) return
+    let startTime: number | null = null
+    const step = (timestamp: number) => {
+      if (!startTime) startTime = timestamp
+      const progress = Math.min((timestamp - startTime) / duration, 1)
+      setValue(Math.floor(progress * target))
+      if (progress < 1) requestAnimationFrame(step)
+    }
+    requestAnimationFrame(step)
+  }, [target, duration, start])
+  return value
+}
+
+/* â”€â”€ Spotlight card â”€â”€ */
+function SpotlightCard({ icon, title, desc }: { icon: string; title: string; desc: string }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [pos, setPos] = useState({ x: 0, y: 0, visible: false })
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    const rect = ref.current!.getBoundingClientRect()
+    setPos({ x: e.clientX - rect.left, y: e.clientY - rect.top, visible: true })
+  }
+
+  return (
+    <div
+      ref={ref}
+      onMouseMove={handleMouseMove}
+      onMouseLeave={() => setPos(p => ({ ...p, visible: false }))}
+      style={{
+        background: "var(--bg-card)",
+        border: "1px solid var(--border)",
+        borderRadius: 16,
+        padding: 32,
+        position: "relative",
+        overflow: "hidden",
+        transition: "border-color 0.3s, transform 0.3s, box-shadow 0.3s",
+        cursor: "default",
+      }}
+      onMouseEnter={e => {
+        const el = e.currentTarget as HTMLElement
+        el.style.borderColor = "var(--border-hover)"
+        el.style.transform = "translateY(-6px)"
+        el.style.boxShadow = "0 24px 60px rgba(0,0,0,0.5)"
+      }}
+      onMouseLeave={e => {
+        const el = e.currentTarget as HTMLElement
+        el.style.borderColor = "var(--border)"
+        el.style.transform = "translateY(0)"
+        el.style.boxShadow = "none"
+      }}
+    >
+      {pos.visible && (
+        <div style={{
+          position: "absolute",
+          top: pos.y - 120,
+          left: pos.x - 120,
+          width: 240, height: 240,
+          background: "radial-gradient(circle, rgba(56,189,248,0.13) 0%, transparent 70%)",
+          pointerEvents: "none",
+          borderRadius: "50%",
+        }} />
+      )}
+      <div style={{
+        position: "absolute", top: 0, left: 0, right: 0, height: 1,
+        background: "linear-gradient(90deg, transparent, rgba(56,189,248,0.45), transparent)",
+        opacity: pos.visible ? 1 : 0, transition: "opacity 0.3s",
+      }} />
+      <div style={{
+        width: 48, height: 48,
+        background: "var(--accent-dim)",
+        border: "1px solid var(--border-hover)",
+        borderRadius: 12,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        fontSize: 22, marginBottom: 20,
+      }}>{icon}</div>
+      <div style={{ fontFamily: "'Syne',sans-serif", fontSize: 18, fontWeight: 600, color: "var(--text-primary)", marginBottom: 10 }}>{title}</div>
+      <div style={{ fontSize: 14, lineHeight: 1.7, color: "var(--text-secondary)" }}>{desc}</div>
+    </div>
+  )
+}
+
+/* â”€â”€ Typewriter â”€â”€ */
+function Typewriter({ words }: { words: string[] }) {
+  const [index, setIndex] = useState(0)
+  const [displayed, setDisplayed] = useState("")
+  const [deleting, setDeleting] = useState(false)
+
+  useEffect(() => {
+    const word = words[index]
+    let timeout: ReturnType<typeof setTimeout>
+    if (!deleting && displayed.length < word.length) {
+      timeout = setTimeout(() => setDisplayed(word.slice(0, displayed.length + 1)), 80)
+    } else if (!deleting && displayed.length === word.length) {
+      timeout = setTimeout(() => setDeleting(true), 2000)
+    } else if (deleting && displayed.length > 0) {
+      timeout = setTimeout(() => setDisplayed(displayed.slice(0, -1)), 45)
+    } else {
+      setDeleting(false)
+      setIndex((index + 1) % words.length)
+    }
+    return () => clearTimeout(timeout)
+  }, [displayed, deleting, index, words])
+
+  return (
+    <span style={{ color: "var(--accent)", borderRight: "3px solid var(--accent)", paddingRight: 3 }}>
+      {displayed}
+    </span>
+  )
+}
+
+/* â”€â”€ Particle canvas â”€â”€ */
+function ParticleCanvas() {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  useEffect(() => {
+    const canvas = canvasRef.current!
+    const ctx = canvas.getContext("2d")!
+    let W = canvas.width = canvas.offsetWidth
+    let H = canvas.height = canvas.offsetHeight
+    const N = 55
+    const particles = Array.from({ length: N }, () => ({
+      x: Math.random() * W, y: Math.random() * H,
+      vx: (Math.random() - 0.5) * 0.4, vy: (Math.random() - 0.5) * 0.4,
+      r: Math.random() * 1.5 + 0.5,
+    }))
+    let raf: number
+    const draw = () => {
+      ctx.clearRect(0, 0, W, H)
+      for (let i = 0; i < N; i++) {
+        const p = particles[i]
+        p.x += p.vx; p.y += p.vy
+        if (p.x < 0 || p.x > W) p.vx *= -1
+        if (p.y < 0 || p.y > H) p.vy *= -1
+        ctx.beginPath()
+        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2)
+        ctx.fillStyle = "rgba(56,189,248,0.55)"
+        ctx.fill()
+        for (let j = i + 1; j < N; j++) {
+          const q = particles[j]
+          const dx = p.x - q.x, dy = p.y - q.y
+          const d = Math.sqrt(dx * dx + dy * dy)
+          if (d < 130) {
+            ctx.beginPath()
+            ctx.moveTo(p.x, p.y)
+            ctx.lineTo(q.x, q.y)
+            ctx.strokeStyle = `rgba(56,189,248,${0.18 * (1 - d / 130)})`
+            ctx.lineWidth = 0.6
+            ctx.stroke()
+          }
+        }
+      }
+      raf = requestAnimationFrame(draw)
+    }
+    draw()
+    const resize = () => { W = canvas.width = canvas.offsetWidth; H = canvas.height = canvas.offsetHeight }
+    window.addEventListener("resize", resize)
+    return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", resize) }
+  }, [])
+  return <canvas ref={canvasRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0.55, pointerEvents: "none" }} />
+}
+
+/* â”€â”€ Stats with counter animation â”€â”€ */
+function StatsRow() {
+  const ref = useRef<HTMLDivElement>(null)
+  const [started, setStarted] = useState(false)
+  useEffect(() => {
+    const obs = new IntersectionObserver(([e]) => { if (e.isIntersecting) setStarted(true) }, { threshold: 0.5 })
+    if (ref.current) obs.observe(ref.current)
+    return () => obs.disconnect()
+  }, [])
+  const accuracy = useCounter(95, 1800, started)
+  const speed = useCounter(30, 1500, started)
+  return (
+    <div ref={ref} style={{
+      display: "flex", justifyContent: "center", gap: 52,
+      marginTop: 64, paddingTop: 48,
+      borderTop: "1px solid var(--border)",
+      flexWrap: "wrap",
+      animation: "fadeIn 1s 0.6s ease both", opacity: 0, animationFillMode: "both",
+    }}>
+      {[
+        { val: "3", label: "Languages Supported" },
+        { val: `~${accuracy}%`, label: "Transcription Accuracy" },
+        { val: `<${speed}s`, label: "Report Generation" },
+        { val: "24/7", label: "Availability" },
+      ].map(s => (
+        <div key={s.label} style={{ textAlign: "center" }}>
+          <div style={{ fontFamily: "'Syne',sans-serif", fontSize: 30, fontWeight: 700, color: "var(--text-primary)" }}>{s.val}</div>
+          <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 5, textTransform: "uppercase", letterSpacing: "0.09em" }}>{s.label}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/* â•â•â•â•â•â•â•â•â•â•â•â•â•â• MAIN PAGE â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+export default function Home() {
+  return (
+    <main style={{
+      minHeight: "100vh",
+      background: "#080c14",
+      color: "#e8edf5",
+      fontFamily: "'DM Sans','Segoe UI',sans-serif",
+      overflowX: "hidden",
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,300&family=Syne:wght@600;700;800&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+          --bg-primary: #080c14;
+          --bg-secondary: #0d1321;
+          --bg-card: #111827;
+          --bg-card-hover: #161f30;
+          --border: rgba(56,189,248,0.12);
+          --border-hover: rgba(56,189,248,0.35);
+          --accent: #38bdf8;
+          --accent-dim: rgba(56,189,248,0.1);
+          --accent-glow: rgba(56,189,248,0.28);
+          --text-primary: #e8edf5;
+          --text-secondary: #8b9ab5;
+          --text-muted: #4a5568;
+          --success: #34d399;
+        }
+
+        body::after {
+          content: '';
+          position: fixed; inset: 0;
+          background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.035) 2px, rgba(0,0,0,0.035) 4px);
+          pointer-events: none; z-index: 9999;
+        }
+
+        @keyframes fadeSlideUp { from { opacity:0; transform:translateY(28px); } to { opacity:1; transform:translateY(0); } }
+        @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+        @keyframes float { 0%,100% { transform:translateY(0) rotate(0deg); } 33% { transform:translateY(-14px) rotate(1deg); } 66% { transform:translateY(-6px) rotate(-1deg); } }
+        @keyframes orbPulse { 0%,100% { opacity:0.6; transform:scale(1) translateX(-50%); } 50% { opacity:1; transform:scale(1.12) translateX(-44%); } }
+        @keyframes shimmer { 0% { background-position:-200% center; } 100% { background-position:200% center; } }
+        @keyframes borderGlow { 0%,100% { box-shadow:0 0 0 0 transparent; } 50% { box-shadow:0 0 0 3px rgba(56,189,248,0.2); } }
+        @keyframes pulseDot { 0%,100% { box-shadow:0 0 4px var(--success); } 50% { box-shadow:0 0 14px var(--success), 0 0 24px rgba(52,211,153,0.35); } }
+
+        .nav-link {
+          background: linear-gradient(135deg,#38bdf8,#0ea5e9);
+          color: #080c14; padding:10px 22px; border-radius:8px;
+          text-decoration:none; font-weight:700; font-size:14px;
+          transition:all 0.25s; display:inline-block;
+          position:relative; overflow:hidden;
+        }
+        .nav-link::before {
+          content:''; position:absolute; top:-100%; left:-60%; width:40%; height:300%;
+          background:rgba(255,255,255,0.22); transform:skewX(-20deg); transition:left 0.4s;
+        }
+        .nav-link:hover::before { left:130%; }
+        .nav-link:hover { box-shadow:0 0 22px var(--accent-glow), 0 0 60px rgba(56,189,248,0.12); transform:translateY(-1px); }
+
+        .hero-badge {
+          display:inline-flex; align-items:center; gap:8px;
+          background:var(--accent-dim); border:1px solid var(--border-hover);
+          border-radius:100px; padding:7px 18px; font-size:13px; font-weight:500; color:var(--accent);
+          margin-bottom:28px;
+          animation:fadeSlideUp 0.6s ease both, borderGlow 3s 1s infinite;
+        }
+        .badge-dot {
+          width:7px; height:7px; background:var(--success); border-radius:50%;
+          animation:pulseDot 2s infinite;
+        }
+
+        .shimmer-text {
+          background:linear-gradient(90deg,#38bdf8 0%,#7dd3fc 30%,#bae6fd 50%,#7dd3fc 70%,#38bdf8 100%);
+          background-size:200% auto;
+          -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+          background-clip:text;
+          animation:shimmer 3s linear infinite;
+        }
+
+        .hero-cta {
+          display:inline-flex; align-items:center; gap:10px;
+          background:linear-gradient(135deg,#38bdf8,#0ea5e9);
+          color:#080c14; padding:14px 32px; border-radius:10px;
+          text-decoration:none; font-weight:700; font-size:15px;
+          transition:all 0.25s; position:relative; overflow:hidden;
+          animation:fadeSlideUp 0.7s 0.3s ease both;
+        }
+        .hero-cta::before {
+          content:''; position:absolute; inset:0;
+          background:linear-gradient(135deg,rgba(255,255,255,0.15),transparent);
+          opacity:0; transition:opacity 0.25s;
+        }
+        .hero-cta:hover::before { opacity:1; }
+        .hero-cta:hover { transform:translateY(-3px); box-shadow:0 16px 44px var(--accent-glow), 0 0 0 1px rgba(56,189,248,0.3); }
+        .arrow { transition:transform 0.2s; display:inline-block; }
+        .hero-cta:hover .arrow { transform:translateX(5px); }
+
+        .ghost-btn {
+          display:inline-flex; align-items:center; gap:8px;
+          background:transparent; color:var(--text-secondary);
+          padding:14px 28px; border-radius:10px;
+          text-decoration:none; font-weight:500; font-size:15px;
+          border:1px solid var(--border); transition:all 0.25s;
+        }
+        .ghost-btn:hover { border-color:var(--border-hover); color:var(--text-primary); background:var(--accent-dim); }
+
+        .lang-pill {
+          display:inline-flex; align-items:center; gap:6px;
+          background:var(--bg-card); border:1px solid var(--border);
+          border-radius:100px; padding:6px 14px; font-size:13px; color:var(--text-secondary);
+          transition:all 0.2s;
+        }
+        .lang-pill:hover { border-color:var(--border-hover); color:var(--text-primary); }
+        .lang-dot { width:6px; height:6px; background:var(--success); border-radius:50%; box-shadow:0 0 6px var(--success); }
+
+        .section-tag { display:inline-block; font-size:11px; font-weight:600; letter-spacing:0.15em; text-transform:uppercase; color:var(--accent); margin-bottom:16px; }
+        .section-title { font-family:'Syne',sans-serif; font-size:clamp(26px,3.5vw,38px); font-weight:700; letter-spacing:-0.02em; color:var(--text-primary); margin-bottom:12px; }
+
+        .grid-bg {
+          background-image: linear-gradient(rgba(56,189,248,0.04) 1px,transparent 1px), linear-gradient(90deg,rgba(56,189,248,0.04) 1px,transparent 1px);
+          background-size:48px 48px;
+        }
+
+        .feature-float { animation:float 6s ease-in-out infinite; }
+        .feature-float:nth-child(2) { animation-delay:-2s; }
+        .feature-float:nth-child(3) { animation-delay:-4s; }
+
+        .features-section { position:relative; }
+        .features-section::before {
+          content:''; position:absolute; top:0; left:50%; transform:translateX(-50%);
+          width:600px; height:1px;
+          background:linear-gradient(90deg,transparent,var(--accent),transparent);
+          animation:shimmer 4s linear infinite;
+        }
+
+        .step-card {
+          background:var(--bg-card); border:1px solid var(--border);
+          border-radius:16px; padding:32px 24px; text-align:center;
+          transition:all 0.3s;
+        }
+        .step-card:hover { border-color:var(--border-hover); transform:translateY(-5px); box-shadow:0 20px 52px rgba(0,0,0,0.45); }
+        .step-num {
+          width:56px; height:56px;
+          background:var(--accent-dim); border:2px solid var(--accent);
+          border-radius:50%; display:flex; align-items:center; justify-content:center;
+          font-family:'Syne',sans-serif; font-size:18px; font-weight:700; color:var(--accent);
+          margin:0 auto 20px;
+          box-shadow:0 0 22px var(--accent-glow);
+        }
+        .steps-wrap { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:24px; position:relative; }
+        .steps-wrap::before {
+          content:''; position:absolute; top:56px; left:10%; right:10%; height:2px;
+          background:linear-gradient(90deg,transparent,var(--border-hover) 20%,var(--accent) 50%,var(--border-hover) 80%,transparent);
+          background-size:200% 100%;
+          animation:shimmer 3s linear infinite;
+        }
+
+        .cta-wrap {
+          background:linear-gradient(135deg,rgba(56,189,248,0.08),rgba(14,165,233,0.04));
+          border:1px solid var(--border-hover);
+          border-radius:24px; padding:64px 48px;
+          position:relative; overflow:hidden;
+        }
+        .cta-wrap::before {
+          content:''; position:absolute; top:-50%; right:-5%;
+          width:360px; height:360px;
+          background:radial-gradient(circle,rgba(56,189,248,0.09),transparent 70%);
+          border-radius:50%; pointer-events:none;
+          animation:float 9s ease-in-out infinite;
+        }
+      `}</style>
+
+      {/* â”€â”€ Navbar â”€â”€ */}
+      <nav style={{
+        display:"flex", justifyContent:"space-between", alignItems:"center",
+        padding:"20px 48px",
+        background:"rgba(8,12,20,0.9)", backdropFilter:"blur(24px)",
+        borderBottom:"1px solid var(--border)",
+        position:"sticky", top:0, zIndex:100,
+      }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <div style={{
+            width:34, height:34,
+            background:"linear-gradient(135deg,#38bdf8,#0ea5e9)",
+            borderRadius:9, display:"flex", alignItems:"center", justifyContent:"center",
+            fontSize:16, boxShadow:"0 0 18px rgba(56,189,248,0.4)",
+          }}>âš•</div>
+          <span style={{ fontFamily:"'Syne',sans-serif", fontSize:20, fontWeight:700, color:"var(--text-primary)", letterSpacing:"-0.02em" }}>
+            MediLingua <span style={{ color:"var(--accent)" }}>AI</span>
+          </span>
+        </div>
+        <div style={{ display:"flex", alignItems:"center", gap:32 }}>
+          {["Features","Workflow","About"].map(item => (
+            <span key={item}
+              style={{ fontSize:14, color:"var(--text-secondary)", cursor:"pointer", transition:"color 0.2s" }}
+              onMouseEnter={e => (e.currentTarget.style.color="var(--text-primary)")}
+              onMouseLeave={e => (e.currentTarget.style.color="var(--text-secondary)")}
+            >{item}</span>
+          ))}
+          <Link href="/login" className="nav-link">Login</Link>
+        </div>
+      </nav>
+
+      {/* â”€â”€ Hero â”€â”€ */}
+      <section className="grid-bg" style={{
+        position:"relative", textAlign:"center",
+        padding:"110px 24px 90px", overflow:"hidden",
+        minHeight:"92vh", display:"flex", flexDirection:"column", justifyContent:"center",
+      }}>
+        <ParticleCanvas />
+
+        {/* Orbs */}
+        <div style={{ position:"absolute", width:640, height:640, background:"radial-gradient(circle,rgba(56,189,248,0.09) 0%,transparent 65%)", top:-120, left:"50%", borderRadius:"50%", pointerEvents:"none", animation:"orbPulse 7s ease-in-out infinite", transformOrigin:"center" }} />
+        <div style={{ position:"absolute", width:340, height:340, background:"radial-gradient(circle,rgba(14,165,233,0.07) 0%,transparent 70%)", bottom:40, right:"8%", borderRadius:"50%", pointerEvents:"none", animation:"float 10s ease-in-out infinite" }} />
+        <div style={{ position:"absolute", width:190, height:190, background:"radial-gradient(circle,rgba(52,211,153,0.06) 0%,transparent 70%)", bottom:80, left:"6%", borderRadius:"50%", pointerEvents:"none", animation:"float 8s 2s ease-in-out infinite" }} />
+
+        <div style={{ position:"relative", zIndex:1 }}>
+          <div className="hero-badge">
+            <span className="badge-dot" />
+            System Operational â€” OPD Ready
+          </div>
+
+          <h1 style={{ fontFamily:"'Syne',sans-serif", fontSize:"clamp(36px,6vw,68px)", fontWeight:800, lineHeight:1.06, letterSpacing:"-0.03em", color:"var(--text-primary)", animation:"fadeSlideUp 0.7s 0.1s ease both" }}>
+            AI-Powered Medical<br />
+            <span className="shimmer-text">Documentation</span> Platform
+          </h1>
+
+          <p style={{ fontSize:17, lineHeight:1.75, color:"var(--text-secondary)", maxWidth:560, margin:"24px auto 0", fontWeight:300, animation:"fadeSlideUp 0.7s 0.2s ease both" }}>
+            Transcribe consultations in{" "}
+            <Typewriter words={["Hindi", "Kannada", "English"]} />{" "}
+            and auto-generate structured medical reports for high-volume OPDs.
+          </p>
+
+          <div style={{ marginTop:44, display:"flex", justifyContent:"center", gap:16, flexWrap:"wrap" }}>
+            <Link href="/login" className="hero-cta">Get Started <span className="arrow">â†’</span></Link>
+            <a href="#features" className="ghost-btn">â–¶ View Demo</a>
+          </div>
+
+          <div style={{ display:"flex", justifyContent:"center", gap:10, marginTop:40, flexWrap:"wrap", animation:"fadeIn 1s 0.5s ease both", opacity:0, animationFillMode:"both" }}>
+            {["ðŸ‡®ðŸ‡³ Hindi","ðŸ‡®ðŸ‡³ Kannada","ðŸ‡¬ðŸ‡§ English"].map(lang => (
+              <span key={lang} className="lang-pill"><span className="lang-dot" />{lang}</span>
+            ))}
+          </div>
+
+          <StatsRow />
+        </div>
+      </section>
+
+      {/* â”€â”€ Features â”€â”€ */}
+      <section id="features" className="features-section" style={{ padding:"96px 40px", background:"var(--bg-secondary)", borderTop:"1px solid var(--border)", borderBottom:"1px solid var(--border)" }}>
+        <div style={{ maxWidth:1100, margin:"0 auto" }}>
+          <div style={{ textAlign:"center", marginBottom:64 }}>
+            <span className="section-tag">Core Features</span>
+            <h2 className="section-title">Everything a busy OPD needs</h2>
+            <p style={{ color:"var(--text-secondary)", fontSize:16, maxWidth:500, margin:"0 auto" }}>From consultation to report in seconds â€” zero manual entry.</p>
+          </div>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))", gap:20 }}>
+            {[
+              { icon:"ðŸŽ™", title:"Multilingual Speech Recognition", desc:"Real-time transcription of Hindi, Kannada, and English with medical vocabulary awareness and adaptive noise filtering." },
+              { icon:"ðŸ“‹", title:"AI-Generated Medical Reports", desc:"Converts raw consultation audio into SOAP-format reports â€” symptoms, diagnosis, prescriptions, all structured in under 30 seconds." },
+              { icon:"ðŸ—‚", title:"Patient History Tracking", desc:"Complete longitudinal OPD records per patient, enabling faster differential diagnoses and better continuity of care." },
+            ].map((f, i) => (
+              <div key={f.title} className="feature-float" style={{ animationDelay:`${i * -2}s` }}>
+                <SpotlightCard {...f} />
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* â”€â”€ How It Works â”€â”€ */}
+      <section style={{ padding:"96px 40px", background:"var(--bg-primary)" }}>
+        <div style={{ maxWidth:1060, margin:"0 auto" }}>
+          <div style={{ textAlign:"center", marginBottom:64 }}>
+            <span className="section-tag">Workflow</span>
+            <h2 className="section-title">From patient entry to report</h2>
+          </div>
+          <div className="steps-wrap">
+            {[
+              { n:"01", title:"Register Patient", desc:"Reception registers the patient and assigns them to the relevant department." },
+              { n:"02", title:"Doctor Consultation", desc:"Doctor begins consultation; conversation is captured in real-time audio." },
+              { n:"03", title:"AI Transcription", desc:"Speech is processed and converted into structured medical text automatically." },
+              { n:"04", title:"Report Generated", desc:"A structured report is finalized, saved, and instantly accessible." },
+            ].map(step => (
+              <div key={step.n} className="step-card">
+                <div className="step-num">{step.n}</div>
+                <div style={{ fontFamily:"'Syne',sans-serif", fontSize:16, fontWeight:600, color:"var(--text-primary)", marginBottom:8 }}>{step.title}</div>
+                <div style={{ fontSize:14, color:"var(--text-secondary)", lineHeight:1.6 }}>{step.desc}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* â”€â”€ CTA â”€â”€ */}
+      <section style={{ padding:"0 40px 80px", maxWidth:1160, margin:"0 auto" }}>
+        <div className="cta-wrap" style={{ display:"flex", justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:32 }}>
+          <div>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontSize:30, fontWeight:700, color:"var(--text-primary)", marginBottom:10 }}>Ready to digitise your OPD?</div>
+            <p style={{ color:"var(--text-secondary)", fontSize:15 }}>Set up takes under 5 minutes. No hardware required.</p>
+          </div>
+          <Link href="/login" className="hero-cta" style={{ flexShrink:0 }}>Start Now <span className="arrow">â†’</span></Link>
+        </div>
+      </section>
+
+      {/* â”€â”€ Footer â”€â”€ */}
+      <footer style={{ borderTop:"1px solid var(--border)", padding:"32px 48px", display:"flex", justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:16 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          <div style={{ width:26, height:26, background:"linear-gradient(135deg,#38bdf8,#0ea5e9)", borderRadius:7, display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, boxShadow:"0 0 10px rgba(56,189,248,0.35)" }}>âš•</div>
+          <span style={{ fontFamily:"'Syne',sans-serif", fontWeight:700, fontSize:15, color:"var(--text-primary)" }}>MediLingua <span style={{ color:"var(--accent)" }}>AI</span></span>
+        </div>
+        <p style={{ color:"var(--text-muted)", fontSize:13 }}>Â© 2026 MediLingua AI â€” Hackathon Project</p>
+        <div style={{ display:"flex", gap:24 }}>
+          {["Privacy","Terms","Contact"].map(l => (
+            <span key={l} style={{ fontSize:13, color:"var(--text-muted)", cursor:"pointer", transition:"color 0.2s" }}
+              onMouseEnter={e => (e.currentTarget.style.color="var(--text-secondary)")}
+              onMouseLeave={e => (e.currentTarget.style.color="var(--text-muted)")}
+            >{l}</span>
+          ))}
+        </div>
+      </footer>
+    </main>
+  )
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\lib\prisma.ts =====
+import { PrismaClient } from "@prisma/client"
+
+const globalForPrisma = global as unknown as {
+  prisma: PrismaClient
+}
+
+export const prisma =
+  globalForPrisma.prisma ||
+  new PrismaClient({
+    log: ["query"]
+  })
+
+if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\prisma\seed.ts =====
+import { PrismaClient, Department } from "@prisma/client"
+
+const prisma = new PrismaClient()
+
+async function main() {
+
+  console.log("Seeding patients and visits...")
+
+  // PATIENTS
+
+  const p1 = await prisma.patient.create({
+    data: {
+      name: "Rahul Sharma",
+      age: 32,
+      gender: "Male",
+      phone: "9876543210"
+    }
+  })
+
+  const p2 = await prisma.patient.create({
+    data: {
+      name: "Priya Verma",
+      age: 28,
+      gender: "Female",
+      phone: "9876543211"
+    }
+  })
+
+  const p3 = await prisma.patient.create({
+    data: {
+      name: "Amit Singh",
+      age: 45,
+      gender: "Male",
+      phone: "9876543212"
+    }
+  })
+
+  const p4 = await prisma.patient.create({
+    data: {
+      name: "Sneha Gupta",
+      age: 22,
+      gender: "Female",
+      phone: "9876543213"
+    }
+  })
+
+  const p5 = await prisma.patient.create({
+    data: {
+      name: "Ramesh Kumar",
+      age: 50,
+      gender: "Male",
+      phone: "9876543214"
+    }
+  })
+
+  // VISITS (Department queues)
+
+  await prisma.visit.createMany({
+    data: [
+      {
+        patientId: p1.id,
+        department: Department.GENERAL_MEDICINE
+      },
+      {
+        patientId: p2.id,
+        department: Department.GENERAL_MEDICINE
+      },
+      {
+        patientId: p3.id,
+        department: Department.ENT
+      },
+      {
+        patientId: p4.id,
+        department: Department.ENT
+      },
+      {
+        patientId: p5.id,
+        department: Department.ORTHOPEDICS
+      }
+    ]
+  })
+
+  console.log("âœ… Patients and visits seeded successfully")
+
+}
+
+main()
+  .catch((e) => {
+    console.error(e)
+    process.exit(1)
+  })
+  .finally(async () => {
+    await prisma.$disconnect()
+  })
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\types\next-auth.d.ts =====
+import NextAuth from "next-auth"
+
+declare module "next-auth" {
+  interface Session {
+    user: {
+      id: string
+      role: string
+      name?: string | null
+      email?: string | null
+      image?: string | null
+    }
+  }
+
+  interface User {
+    id: string
+    role: string
+  }
+}
+
+declare module "next-auth/jwt" {
+  interface JWT {
+    role?: string
+  }
+}
+
+
+===== C:\Users\Jatin\Desktop\TurboS-DWR\next.config.ts =====
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  /* config options here */
+};
+
+export default nextConfig;
+
+
