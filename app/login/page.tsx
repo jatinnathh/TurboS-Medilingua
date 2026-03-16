@@ -77,7 +77,10 @@ export default function LoginPage() {
     })
     setLoading(false)
   }
-
+  const fillDemoCredentials = () => {
+    setEmail("general@hospital.com")
+    setPassword("password123")
+  }
   const handleKey = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") handleLogin()
   }
@@ -274,69 +277,69 @@ export default function LoginPage() {
       <ParticleCanvas />
 
       {/* ── Ambient orbs ── */}
-      <div style={{ position:"absolute", width:500, height:500, background:"radial-gradient(circle,rgba(56,189,248,0.07) 0%,transparent 65%)", top:-80, left:"30%", borderRadius:"50%", pointerEvents:"none", animation:"orbFloat 9s ease-in-out infinite" }} />
-      <div style={{ position:"absolute", width:300, height:300, background:"radial-gradient(circle,rgba(14,165,233,0.06) 0%,transparent 70%)", bottom:60, right:"10%", borderRadius:"50%", pointerEvents:"none", animation:"orbFloat 7s 3s ease-in-out infinite" }} />
+      <div style={{ position: "absolute", width: 500, height: 500, background: "radial-gradient(circle,rgba(56,189,248,0.07) 0%,transparent 65%)", top: -80, left: "30%", borderRadius: "50%", pointerEvents: "none", animation: "orbFloat 9s ease-in-out infinite" }} />
+      <div style={{ position: "absolute", width: 300, height: 300, background: "radial-gradient(circle,rgba(14,165,233,0.06) 0%,transparent 70%)", bottom: 60, right: "10%", borderRadius: "50%", pointerEvents: "none", animation: "orbFloat 7s 3s ease-in-out infinite" }} />
 
       {/* Grid bg */}
       <div style={{
-        position:"absolute", inset:0, pointerEvents:"none",
-        backgroundImage:"linear-gradient(rgba(56,189,248,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(56,189,248,0.03) 1px,transparent 1px)",
-        backgroundSize:"48px 48px",
+        position: "absolute", inset: 0, pointerEvents: "none",
+        backgroundImage: "linear-gradient(rgba(56,189,248,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(56,189,248,0.03) 1px,transparent 1px)",
+        backgroundSize: "48px 48px",
       }} />
 
       {/* ══ LEFT PANEL ══ */}
       <div style={{
-        flex: 1, display:"flex", flexDirection:"column",
-        justifyContent:"center", padding:"60px 64px",
-        position:"relative", zIndex:1,
-        borderRight:"1px solid var(--border)",
+        flex: 1, display: "flex", flexDirection: "column",
+        justifyContent: "center", padding: "60px 64px",
+        position: "relative", zIndex: 1,
+        borderRight: "1px solid var(--border)",
       }} className="hide-mobile">
 
         {/* Decorative rings */}
-        <div className="deco-ring" style={{ width:320, height:320, top:-80, right:-80, animationDelay:"0s" }} />
-        <div className="deco-ring" style={{ width:180, height:180, bottom:100, left:-40, animationDelay:"-3s" }} />
+        <div className="deco-ring" style={{ width: 320, height: 320, top: -80, right: -80, animationDelay: "0s" }} />
+        <div className="deco-ring" style={{ width: 180, height: 180, bottom: 100, left: -40, animationDelay: "-3s" }} />
 
         {/* Logo */}
-        <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:64 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 64 }}>
           <div style={{
-            width:38, height:38,
-            background:"linear-gradient(135deg,#38bdf8,#0ea5e9)",
-            borderRadius:10, display:"flex", alignItems:"center", justifyContent:"center",
-            fontSize:18, boxShadow:"0 0 20px rgba(56,189,248,0.4)",
+            width: 38, height: 38,
+            background: "linear-gradient(135deg,#38bdf8,#0ea5e9)",
+            borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: 18, boxShadow: "0 0 20px rgba(56,189,248,0.4)",
           }}>⚕</div>
-          <span style={{ fontFamily:"'Syne',sans-serif", fontSize:22, fontWeight:700, color:"var(--text-primary)", letterSpacing:"-0.02em" }}>
-            MediLingua <span style={{ color:"var(--accent)" }}>AI</span>
+          <span style={{ fontFamily: "'Syne',sans-serif", fontSize: 22, fontWeight: 700, color: "var(--text-primary)", letterSpacing: "-0.02em" }}>
+            MediLingua <span style={{ color: "var(--accent)" }}>AI</span>
           </span>
         </div>
 
-        <div style={{ marginBottom:48 }}>
-          <div style={{ fontFamily:"'Syne',sans-serif", fontSize:"clamp(28px,3vw,42px)", fontWeight:800, lineHeight:1.1, letterSpacing:"-0.03em", color:"var(--text-primary)", marginBottom:16 }}>
+        <div style={{ marginBottom: 48 }}>
+          <div style={{ fontFamily: "'Syne',sans-serif", fontSize: "clamp(28px,3vw,42px)", fontWeight: 800, lineHeight: 1.1, letterSpacing: "-0.03em", color: "var(--text-primary)", marginBottom: 16 }}>
             Smarter OPD.<br />
             <span style={{
-              background:"linear-gradient(90deg,#38bdf8,#7dd3fc,#38bdf8)",
-              backgroundSize:"200% auto",
-              WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent",
-              backgroundClip:"text",
-              animation:"shimmer 3s linear infinite",
+              background: "linear-gradient(90deg,#38bdf8,#7dd3fc,#38bdf8)",
+              backgroundSize: "200% auto",
+              WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
+              backgroundClip: "text",
+              animation: "shimmer 3s linear infinite",
             }}>Zero Paperwork.</span>
           </div>
-          <p style={{ fontSize:15, lineHeight:1.7, color:"var(--text-secondary)", maxWidth:380 }}>
+          <p style={{ fontSize: 15, lineHeight: 1.7, color: "var(--text-secondary)", maxWidth: 380 }}>
             AI-powered transcription and report generation for high-volume Indian hospitals.
           </p>
         </div>
 
         {/* Feature list */}
-        <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
           {[
-            { icon:"🎙", title:"Multilingual transcription", sub:"Hindi, Kannada & English", delay:"0.1s" },
-            { icon:"📋", title:"Instant SOAP reports", sub:"Structured in under 30 seconds", delay:"0.2s" },
-            { icon:"🗂", title:"Patient history at a glance", sub:"Full longitudinal OPD records", delay:"0.3s" },
+            { icon: "🎙", title: "Multilingual transcription", sub: "Hindi, Kannada & English", delay: "0.1s" },
+            { icon: "📋", title: "Instant SOAP reports", sub: "Structured in under 30 seconds", delay: "0.2s" },
+            { icon: "🗂", title: "Patient history at a glance", sub: "Full longitudinal OPD records", delay: "0.3s" },
           ].map(f => (
             <div key={f.title} className="feature-item" style={{ animationDelay: f.delay }}>
               <div className="feature-icon-wrap">{f.icon}</div>
               <div>
-                <div style={{ fontSize:14, fontWeight:600, color:"var(--text-primary)", marginBottom:2 }}>{f.title}</div>
-                <div style={{ fontSize:13, color:"var(--text-muted)" }}>{f.sub}</div>
+                <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)", marginBottom: 2 }}>{f.title}</div>
+                <div style={{ fontSize: 13, color: "var(--text-muted)" }}>{f.sub}</div>
               </div>
             </div>
           ))}
@@ -344,67 +347,67 @@ export default function LoginPage() {
 
         {/* Bottom badge */}
         <div style={{
-          marginTop:56,
-          display:"inline-flex", alignItems:"center", gap:8,
-          background:"rgba(52,211,153,0.08)",
-          border:"1px solid rgba(52,211,153,0.2)",
-          borderRadius:100, padding:"7px 16px",
-          width:"fit-content",
+          marginTop: 56,
+          display: "inline-flex", alignItems: "center", gap: 8,
+          background: "rgba(52,211,153,0.08)",
+          border: "1px solid rgba(52,211,153,0.2)",
+          borderRadius: 100, padding: "7px 16px",
+          width: "fit-content",
         }}>
-          <span style={{ width:7, height:7, background:"#34d399", borderRadius:"50%", display:"inline-block", boxShadow:"0 0 8px #34d399" }} />
-          <span style={{ fontSize:12, color:"#34d399", fontWeight:500 }}>All systems operational</span>
+          <span style={{ width: 7, height: 7, background: "#34d399", borderRadius: "50%", display: "inline-block", boxShadow: "0 0 8px #34d399" }} />
+          <span style={{ fontSize: 12, color: "#34d399", fontWeight: 500 }}>All systems operational</span>
         </div>
       </div>
 
       {/* ══ RIGHT PANEL — Login Form ══ */}
       <div style={{
-        width:"min(100%, 480px)",
-        display:"flex", flexDirection:"column",
-        justifyContent:"center", alignItems:"center",
-        padding:"48px 40px",
-        position:"relative", zIndex:1,
+        width: "min(100%, 480px)",
+        display: "flex", flexDirection: "column",
+        justifyContent: "center", alignItems: "center",
+        padding: "48px 40px",
+        position: "relative", zIndex: 1,
       }}>
         <div
           className={`login-card${shake ? " shake" : ""}`}
-          style={{ width:"100%", maxWidth:400 }}
+          style={{ width: "100%", maxWidth: 400 }}
         >
           {/* Card header */}
-          <div style={{ marginBottom:36 }}>
+          <div style={{ marginBottom: 36 }}>
             {/* Mobile logo */}
-            <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:32 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 32 }}>
               <div style={{
-                width:30, height:30,
-                background:"linear-gradient(135deg,#38bdf8,#0ea5e9)",
-                borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center",
-                fontSize:14, boxShadow:"0 0 14px rgba(56,189,248,0.35)",
+                width: 30, height: 30,
+                background: "linear-gradient(135deg,#38bdf8,#0ea5e9)",
+                borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center",
+                fontSize: 14, boxShadow: "0 0 14px rgba(56,189,248,0.35)",
               }}>⚕</div>
-              <span style={{ fontFamily:"'Syne',sans-serif", fontSize:16, fontWeight:700, color:"var(--text-primary)" }}>
-                MediLingua <span style={{ color:"var(--accent)" }}>AI</span>
+              <span style={{ fontFamily: "'Syne',sans-serif", fontSize: 16, fontWeight: 700, color: "var(--text-primary)" }}>
+                MediLingua <span style={{ color: "var(--accent)" }}>AI</span>
               </span>
             </div>
 
-            <h1 style={{ fontFamily:"'Syne',sans-serif", fontSize:28, fontWeight:800, color:"var(--text-primary)", letterSpacing:"-0.02em", marginBottom:8 }}>
+            <h1 style={{ fontFamily: "'Syne',sans-serif", fontSize: 28, fontWeight: 800, color: "var(--text-primary)", letterSpacing: "-0.02em", marginBottom: 8 }}>
               Welcome back
             </h1>
-            <p style={{ fontSize:14, color:"var(--text-secondary)" }}>
+            <p style={{ fontSize: 14, color: "var(--text-secondary)" }}>
               Sign in to your MediLingua workspace
             </p>
           </div>
 
           {/* Card body */}
           <div style={{
-            background:"var(--bg-card)",
-            border:"1px solid var(--border)",
-            borderRadius:18,
-            padding:"32px 28px",
-            backdropFilter:"blur(20px)",
-            boxShadow:"0 24px 64px rgba(0,0,0,0.5), inset 0 1px 0 rgba(56,189,248,0.06)",
+            background: "var(--bg-card)",
+            border: "1px solid var(--border)",
+            borderRadius: 18,
+            padding: "32px 28px",
+            backdropFilter: "blur(20px)",
+            boxShadow: "0 24px 64px rgba(0,0,0,0.5), inset 0 1px 0 rgba(56,189,248,0.06)",
           }}>
 
             {/* Email */}
-            <div style={{ marginBottom:20 }}>
+            <div style={{ marginBottom: 20 }}>
               <label className="label">Email address</label>
-              <div style={{ position:"relative" }}>
+              <div style={{ position: "relative" }}>
                 <input
                   className="input-field"
                   placeholder="doctor@hospital.in"
@@ -417,17 +420,17 @@ export default function LoginPage() {
                   style={{ paddingLeft: 42 }}
                 />
                 <span style={{
-                  position:"absolute", left:14, top:"50%", transform:"translateY(-50%)",
-                  fontSize:15, opacity: focused === "email" ? 1 : 0.45,
-                  transition:"opacity 0.2s",
+                  position: "absolute", left: 14, top: "50%", transform: "translateY(-50%)",
+                  fontSize: 15, opacity: focused === "email" ? 1 : 0.45,
+                  transition: "opacity 0.2s",
                 }}>✉</span>
               </div>
             </div>
 
             {/* Password */}
-            <div style={{ marginBottom:12 }}>
+            <div style={{ marginBottom: 12 }}>
               <label className="label">Password</label>
-              <div style={{ position:"relative" }}>
+              <div style={{ position: "relative" }}>
                 <input
                   className="input-field"
                   placeholder="••••••••••"
@@ -437,12 +440,12 @@ export default function LoginPage() {
                   onKeyDown={handleKey}
                   onFocus={() => setFocused("password")}
                   onBlur={() => setFocused(null)}
-                  style={{ paddingLeft:42, paddingRight:52 }}
+                  style={{ paddingLeft: 42, paddingRight: 52 }}
                 />
                 <span style={{
-                  position:"absolute", left:14, top:"50%", transform:"translateY(-50%)",
-                  fontSize:15, opacity: focused === "password" ? 1 : 0.45,
-                  transition:"opacity 0.2s",
+                  position: "absolute", left: 14, top: "50%", transform: "translateY(-50%)",
+                  fontSize: 15, opacity: focused === "password" ? 1 : 0.45,
+                  transition: "opacity 0.2s",
                 }}>🔒</span>
                 <button className="show-pass-btn" onClick={() => setShowPass(s => !s)} type="button">
                   {showPass ? "Hide" : "Show"}
@@ -451,32 +454,50 @@ export default function LoginPage() {
             </div>
 
             {/* Forgot */}
-            <div style={{ textAlign:"right", marginBottom:28 }}>
-              <a href="#" style={{ fontSize:13, color:"var(--accent)", textDecoration:"none", opacity:0.8, transition:"opacity 0.2s" }}
-                onMouseEnter={e => (e.currentTarget.style.opacity="1")}
-                onMouseLeave={e => (e.currentTarget.style.opacity="0.8")}
+            <div style={{ textAlign: "right", marginBottom: 28 }}>
+              <a href="#" style={{ fontSize: 13, color: "var(--accent)", textDecoration: "none", opacity: 0.8, transition: "opacity 0.2s" }}
+                onMouseEnter={e => (e.currentTarget.style.opacity = "1")}
+                onMouseLeave={e => (e.currentTarget.style.opacity = "0.8")}
               >Forgot password?</a>
             </div>
 
             {/* Login button */}
             <button className="login-btn" onClick={handleLogin} disabled={loading}>
+
               {loading ? (
-                <span style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:10 }}>
+                <span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
                   <span className="spinner" />
                   Signing in…
                 </span>
               ) : "Sign In →"}
             </button>
+            {/* Demo login helper */}
+            <div
+              onClick={fillDemoCredentials}
+              style={{
+                marginTop: 14,
+                fontSize: 13,
+                color: "var(--accent)",
+                textAlign: "center",
+                cursor: "pointer",
+                opacity: 0.8,
+                transition: "all 0.2s",
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.opacity = "1")}
+              onMouseLeave={(e) => (e.currentTarget.style.opacity = "0.8")}
+            >
+              Use demo account credentials
+            </div>
 
-           
 
-           
+
+
           </div>
 
           {/* Footer */}
-          <p style={{ textAlign:"center", fontSize:13, color:"var(--text-muted)", marginTop:24 }}>
+          <p style={{ textAlign: "center", fontSize: 13, color: "var(--text-muted)", marginTop: 24 }}>
             Don't have an account?{" "}
-            <Link href="/register" style={{ color:"var(--accent)", textDecoration:"none", fontWeight:500 }}>
+            <Link href="/register" style={{ color: "var(--accent)", textDecoration: "none", fontWeight: 500 }}>
               Request access →
             </Link>
           </p>
