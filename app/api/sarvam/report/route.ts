@@ -1,41 +1,21 @@
 // app/api/sarvam/report/route.ts
 //
-// PIPELINE:
-//   1. Build English transcript from messages
-//   2. Send to HuggingFace d4data/biomedical-ner-all (medical NER)
-//   3. Map NER entity labels → report fields
-//   4. Fill any gaps with light rule-based patterns
-//   5. Return structured MedicalReport JSON
+// HYBRID APPROACH: NER + Groq LLM
+// ─────────────────────────────────
+// Step 1 — Run biomedical NER (HuggingFace free) on English transcript
+//           → extracts raw medical entity hints
+// Step 2 — Send transcript + NER hints to Groq (free tier, llama-3.1-8b-instant)
+//           → LLM understands context, structures the final SOAP report
+// Step 3 — Rule-based fallback if both fail
 //
-// NER model: d4data/biomedical-ner-all
-//   Trained on BC5CDR + NCBI + JNLPBA + i2b2 corpora
-//   Entity types: Disease, Drug, Dosage, Symptom, Body_Part,
-//                 Lab_value, Medical_procedure, Sign_symptom, etc.
-//
-// Env vars needed:
-//   HUGGINGFACE_API_KEY — free tier works fine for inference
+// Required env vars:
+//   HUGGINGFACE_API_KEY=hf_xxx   (free at huggingface.co/settings/tokens)
+//   GROQ_API_KEY=gsk_xxx         (free at console.groq.com)
 
 import { NextRequest, NextResponse } from "next/server"
 
-const HF_KEY   = process.env.HUGGINGFACE_API_KEY!
-const NER_URL  = "https://api-inference.huggingface.co/models/d4data/biomedical-ner-all"
-
-/* ─── Types ─── */
-interface Message {
-  role:       "patient" | "doctor"
-  text:       string
-  english?:   string
-  translated?: string
-  timestamp:  string
-}
-
-interface NEREntity {
-  entity_group: string   // e.g. "Disease_disorder", "Medication", "Sign_symptom"
-  word:         string
-  score:        number
-  start:        number
-  end:          number
-}
+const HF_URL   = "https://router.huggingface.co/hf-inference/models/d4data/biomedical-ner-all"
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 interface MedicalReport {
   chiefComplaint:           string
@@ -50,165 +30,195 @@ interface MedicalReport {
   additionalNotes:          string
 }
 
-/* ─── NER entity label → report field mapping ─── */
-// d4data/biomedical-ner-all label set:
-const LABEL_MAP: Record<string, keyof MedicalReport | null> = {
-  // Symptoms / complaints
-  "Sign_symptom":         "symptoms",
-  "Symptom":              "symptoms",
-  "Sign":                 "symptoms",
+type Msg = { role: string; text: string; english?: string; translated?: string }
 
-  // Diagnosis / disease
-  "Disease_disorder":     "diagnosis",
-  "Disease":              "diagnosis",
-  "Disorder":             "diagnosis",
-  "Pathology":            "diagnosis",
-
-  // Medications / drugs
-  "Medication":           "medications",
-  "Drug":                 "medications",
-  "Medicine":             "medications",
-  "Therapeutic_procedure":"treatment",
-
-  // Investigations / labs
-  "Lab_value":            "investigations",
-  "Laboratory_procedure": "investigations",
-  "Diagnostic_procedure": "investigations",
-  "Diagnostic_imaging":   "investigations",
-
-  // Anatomy — used for exam findings
-  "Body_part":            "examFindings",
-  "Anatomy":              "examFindings",
-
-  // Dosage / frequency — appended to medications
-  "Dosage":               null,   // handled separately
-  "Frequency":            null,   // handled separately
-  "Duration":             null,   // handled separately
-
-  // Misc clinical
-  "Clinical_event":       "additionalNotes",
-  "Biological_structure": "examFindings",
+/* ─────────────────────────────────────────
+   UTIL
+───────────────────────────────────────── */
+function buildEnglishTranscript(messages: Msg[]): string {
+  return messages
+    .map(m => `${m.role === "patient" ? "Patient" : "Doctor"}: ${m.english ?? m.translated ?? m.text}`)
+    .join("\n")
 }
 
-/* ─── Deduplicate array, normalize casing ─── */
-function dedup(arr: string[]): string[] {
-  const seen = new Set<string>()
-  return arr
-    .map(s => s.trim().replace(/\s+/g, " "))
-    .filter(s => s.length > 1)
-    .filter(s => { const k = s.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true })
+function cap(s: string) { return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() }
+function dedup(arr: string[]) { return [...new Set(arr.map(s => s.trim()).filter(Boolean))] }
+
+/* ─────────────────────────────────────────
+   STEP 1 — NER (entity hints only, best-effort)
+───────────────────────────────────────── */
+interface NEREntity { word: string; entity_group?: string; entity?: string; score: number; start?: number; end?: number }
+
+async function runNER(text: string): Promise<NEREntity[]> {
+  try {
+    const res = await fetch(HF_URL, {
+      method:  "POST",
+      headers: { "Authorization": `Bearer ${process.env.HUGGINGFACE_API_KEY}`, "Content-Type": "application/json" },
+      body:    JSON.stringify({ inputs: text }),
+    })
+    if (!res.ok) return []
+    const data = await res.json()
+    return Array.isArray(data) ? data as NEREntity[] : []
+  } catch { return [] }
 }
 
-/* ─── Merge dosage/frequency tokens with adjacent medication tokens ─── */
-function mergeMedications(entities: NEREntity[], fullText: string): string[] {
-  const meds: string[] = []
+function mergeAndCleanNER(raw: NEREntity[]): { symptoms: string[]; medications: string[]; diagnoses: string[]; investigations: string[] } {
+  // Merge consecutive same-label tokens (BERT subword fix)
+  const merged: NEREntity[] = []
+  let cur: NEREntity | null = null
+  for (const e of raw) {
+    if (!cur) { cur = { ...e }; continue }
+    const sameLabel  = (cur.entity_group ?? cur.entity) === (e.entity_group ?? e.entity)
+    const adjacent   = (e.start ?? 0) - (cur.end ?? 0) <= 3
+    if (sameLabel && adjacent) {
+      cur.word  = (cur.word + e.word.replace(/^##/, " ")).trim()
+      cur.end   = e.end
+      cur.score = Math.max(cur.score, e.score)
+    } else { merged.push(cur); cur = { ...e } }
+  }
+  if (cur) merged.push(cur)
 
-  entities.forEach((ent, idx) => {
-    const label = ent.entity_group
-    if (!["Medication","Drug","Medicine"].includes(label)) return
+  const symptoms: string[]      = []
+  const medications: string[]   = []
+  const diagnoses: string[]     = []
+  const investigations: string[] = []
 
-    let medStr = ent.word
-    // Look ahead up to 3 tokens for dosage / frequency
-    for (let j = idx + 1; j <= idx + 3 && j < entities.length; j++) {
-      const next = entities[j]
-      if (["Dosage","Frequency","Duration"].includes(next.entity_group)) {
-        // Only merge if tokens are close in source text (within 30 chars)
-        if (Math.abs(next.start - ent.end) < 30) {
-          medStr += ` ${next.word}`
-        }
-      }
-    }
-    meds.push(medStr)
+  for (const e of merged) {
+    if (e.score < 0.55) continue
+    const label = (e.entity_group ?? e.entity ?? "").toUpperCase()
+    const word  = e.word.replace(/^##/, "").replace(/[^\w\s\-]/g, "").trim()
+    if (!word || word.length < 3) continue
+    // Skip pure numbers / fragments
+    if (/^\d+$/.test(word)) continue
+    if (["the","and","or","is","a","an","of","to","in","for","was","has","yes","no","not","any","some"].includes(word.toLowerCase())) continue
+
+    if (/SIGN|SYMPTOM/.test(label))              symptoms.push(cap(word))
+    else if (/DISEASE|DISORDER/.test(label))     diagnoses.push(cap(word))
+    else if (/MEDICATION|DRUG|PHARMA/.test(label)) medications.push(cap(word))
+    else if (/DIAGNOSTIC|LAB|PROCEDURE/.test(label) && !/^\d/.test(word)) investigations.push(cap(word))
+  }
+
+  return { symptoms: dedup(symptoms), medications: dedup(medications), diagnoses: dedup(diagnoses), investigations: dedup(investigations) }
+}
+
+/* ─────────────────────────────────────────
+   STEP 2 — Groq LLM structuring
+───────────────────────────────────────── */
+async function extractWithGroq(
+  transcript: string,
+  nerHints: ReturnType<typeof mergeAndCleanNER>,
+  patientName: string, patientAge: number, patientGender: string, department: string
+): Promise<MedicalReport> {
+
+  const hintsBlock = `
+NER pre-extracted hints (use as guidance, verify against transcript):
+- Symptoms found: ${nerHints.symptoms.join(", ") || "none detected"}
+- Medications found: ${nerHints.medications.join(", ") || "none detected"}
+- Diagnoses found: ${nerHints.diagnoses.join(", ") || "none detected"}
+- Investigations found: ${nerHints.investigations.join(", ") || "none detected"}`
+
+  const systemPrompt = `You are a precise clinical documentation assistant. Extract a structured SOAP medical report from a doctor-patient conversation.
+
+Return ONLY a valid JSON object — no markdown, no explanation, no code fences. Follow this exact structure:
+{
+  "chiefComplaint": "Patient's main complaint in one clear English sentence",
+  "historyOfPresentIllness": "2-3 sentence summary of the illness history from patient statements, in English",
+  "symptoms": ["Fever", "Headache", "Body ache"],
+  "examFindings": "Any physical exam findings mentioned, or empty string",
+  "diagnosis": "Doctor's stated diagnosis or most likely condition, or empty string",
+  "treatment": ["Drink plenty of fluids", "Take adequate rest"],
+  "medications": ["Paracetamol 650mg every 6 hours"],
+  "investigations": ["CBC", "Dengue screening", "Malaria screening"],
+  "followUp": "Follow-up instruction if mentioned, or empty string",
+  "additionalNotes": "Any urgent warning signs or other important notes"
+}
+
+Rules:
+- chiefComplaint and historyOfPresentIllness MUST be in English — translate from any other language
+- symptoms: each symptom as a separate item, capitalised
+- medications: include full name + dosage if mentioned, e.g. "Paracetamol 650mg every 6 hours"
+- investigations: only actual tests ordered by the doctor
+- treatment: care instructions (rest, fluids, diet) separate from medications
+- followUp: when to return or follow up
+- additionalNotes: warning signs, red flags, urgent instructions
+- Empty string "" for missing text fields, [] for missing array fields
+- Never hallucinate — only extract what is explicitly in the transcript`
+
+  const userContent = `Patient: ${patientName}, Age: ${patientAge}, Gender: ${patientGender}, Department: ${department}
+
+${hintsBlock}
+
+Full consultation transcript:
+${transcript}`
+
+  const res = await fetch(GROQ_URL, {
+    method:  "POST",
+    headers: { "Authorization": `Bearer ${process.env.GROQ_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model:       "llama-3.1-8b-instant",
+      temperature: 0.1,
+      max_tokens:  1024,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: userContent  },
+      ],
+    }),
   })
 
-  return dedup(meds)
+  if (!res.ok) throw new Error(`Groq API error: ${res.status} ${await res.text()}`)
+
+  const data = await res.json() as { choices: Array<{ message: { content: string } }> }
+  const raw  = data.choices?.[0]?.message?.content?.trim() ?? ""
+
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim()
+  return JSON.parse(cleaned) as MedicalReport
 }
 
-/* ─── Call HuggingFace NER inference ─── */
-async function runNER(text: string): Promise<NEREntity[]> {
-  // Chunk text if > 512 tokens (model limit) — ~400 words per chunk
-  const words  = text.split(" ")
-  const chunks: string[] = []
-  for (let i = 0; i < words.length; i += 380) {
-    chunks.push(words.slice(i, i + 380).join(" "))
+/* ─────────────────────────────────────────
+   STEP 3 — Pure rule-based fallback
+───────────────────────────────────────── */
+function extractRuleBased(messages: Msg[]): MedicalReport {
+  const patientLines = messages.filter(m => m.role === "patient").map(m => m.english ?? m.translated ?? m.text)
+  const doctorLines  = messages.filter(m => m.role === "doctor").map(m => m.english ?? m.translated ?? m.text)
+  const patientText  = patientLines.join(" ")
+  const doctorText   = doctorLines.join(" ")
+  const fullText     = patientText + " " + doctorText
+
+  const SYMPTOM_KW = ["fever","headache","body ache","body pain","cough","sore throat","fatigue","weakness","nausea","vomiting","diarrhea","chills","breathlessness","rash","swelling","dizziness"]
+  const symptoms = SYMPTOM_KW.filter(kw => new RegExp(`\\b${kw}\\b`, "i").test(fullText)).map(kw => cap(kw))
+
+  const MED_KW = ["paracetamol","ibuprofen","amoxicillin","azithromycin","dolo","cetirizine","pantoprazole","omeprazole","aspirin"]
+  const medications: string[] = []
+  MED_KW.forEach(med => {
+    const m = fullText.match(new RegExp(`\\b${med}[^.]{0,40}`, "i"))
+    if (m) medications.push(m[0].trim())
+  })
+
+  const INV_KW = ["cbc","blood test","dengue","malaria","urine test","x-ray","ecg","ultrasound","complete blood count"]
+  const investigations = INV_KW.filter(kw => new RegExp(`\\b${kw}\\b`, "i").test(doctorText)).map(kw => kw.toUpperCase())
+
+  const dxMatch = doctorText.match(/(?:may be|likely|probably|it is|viral|bacterial|infection|fever|flu)\s*(?:a\s+)?([a-z][a-z\s]{3,30})/i)
+  const diagnosis = dxMatch ? cap(dxMatch[0].trim()) : ""
+
+  const fuMatch = doctorText.match(/(?:come back|return|follow.?up|review|after \d)[^.]+/i)
+
+  return {
+    chiefComplaint:          patientLines[0] ?? "",
+    historyOfPresentIllness: patientLines.join(" "),
+    symptoms:                dedup(symptoms),
+    examFindings:            "",
+    diagnosis,
+    treatment:               [],
+    medications:             dedup(medications),
+    investigations:          dedup(investigations),
+    followUp:                fuMatch?.[0]?.trim() ?? "",
+    additionalNotes:         "",
   }
-
-  const allEntities: NEREntity[] = []
-  let   offset = 0
-
-  for (const chunk of chunks) {
-    const res = await fetch(NER_URL, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${HF_KEY}`,
-        "Content-Type":  "application/json",
-      },
-      body: JSON.stringify({
-        inputs: chunk,
-        parameters: { aggregation_strategy: "simple" },
-        options:    { wait_for_model: true },
-      }),
-    })
-
-    if (!res.ok) {
-      const err = await res.text()
-      console.warn(`NER chunk failed (offset ${offset}):`, err)
-      // Continue with other chunks
-    } else {
-      const entities: NEREntity[] = await res.json()
-      // Adjust char offsets for chunking
-      entities.forEach(e => {
-        e.start += offset
-        e.end   += offset
-      })
-      allEntities.push(...entities)
-    }
-
-    offset += chunk.length + 1
-  }
-
-  return allEntities
 }
 
-/* ─── Rule-based patterns for fields NER misses ─── */
-function extractFollowUp(doctorLines: string[]): string {
-  const patterns = [
-    /come\s+back\s+in\s+[\w\s]+/i,
-    /follow[\s-]?up\s+in\s+[\w\s]+/i,
-    /review\s+after\s+[\w\s]+/i,
-    /return\s+if\s+.+/i,
-    /visit\s+again\s+.+/i,
-  ]
-  for (const line of doctorLines) {
-    for (const pat of patterns) {
-      const m = line.match(pat)
-      if (m) return m[0]
-    }
-  }
-  // Fallback: any doctor line mentioning follow/return/review
-  return doctorLines.find(l =>
-    /follow|return|review|appointment|revisit/i.test(l)
-  ) ?? "As needed"
-}
-
-function extractChiefComplaint(patientLines: string[]): string {
-  // First patient message is almost always the presenting complaint
-  const first = patientLines[0] ?? ""
-  // Try to trim to first sentence
-  const sentence = first.match(/[^.!?]+[.!?]?/)?.[0] ?? first
-  return sentence.trim().slice(0, 200) || "Not documented"
-}
-
-function extractExamFindings(doctorLines: string[], bodyParts: string[]): string {
-  // Combine body part NER hits with doctor lines mentioning examination
-  const examLines = doctorLines.filter(l =>
-    /exam|finding|tender|swollen|normal|clear|auscult|palpat|inspect|vital|bp|pulse|temp|spo2/i.test(l)
-  )
-  const parts = bodyParts.length ? `Involved areas: ${dedup(bodyParts).join(", ")}. ` : ""
-  return parts + (examLines[0] ?? "Not documented")
-}
-
-/* ══════════ MAIN HANDLER ══════════ */
+/* ─────────────────────────────────────────
+   MAIN HANDLER
+───────────────────────────────────────── */
 export async function POST(req: NextRequest) {
   try {
     const { messages, patientName, patientAge, patientGender, department } = await req.json()
@@ -217,145 +227,35 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "No messages provided" }, { status: 400 })
     }
 
-    /* Step 1 — Build English transcript */
-    const patientLines: string[] = []
-    const doctorLines:  string[] = []
+    const msgs: Msg[]    = messages
+    const transcript     = buildEnglishTranscript(msgs)
 
-    ;(messages as Message[]).forEach(m => {
-      const text = m.english ?? m.translated ?? m.text
-      if (m.role === "patient") patientLines.push(text)
-      else                      doctorLines.push(text)
-    })
+    // Step 1 — NER hints (best-effort, won't block if it fails)
+    const nerHints = mergeAndCleanNER(await runNER(transcript))
+    console.log("[report] NER hints:", nerHints)
 
-    const fullTranscript = (messages as Message[])
-      .map(m => {
-        const speaker = m.role === "patient" ? "Patient" : "Doctor"
-        const text    = m.english ?? m.translated ?? m.text
-        return `${speaker}: ${text}`
-      })
-      .join("\n")
+    // Step 2 — Groq structures the report using transcript + NER hints
+    let report: MedicalReport
+    let source = "groq+ner"
 
-    /* Step 2 — Run NER */
-    let entities: NEREntity[] = []
     try {
-      entities = await runNER(fullTranscript)
-    } catch (nerErr) {
-      console.error("NER failed, using rule-based fallback:", nerErr)
+      report = await extractWithGroq(
+        transcript, nerHints,
+        patientName ?? "Unknown",
+        patientAge  ?? 0,
+        patientGender ?? "Not specified",
+        department ?? "General"
+      )
+    } catch (groqErr) {
+      console.error("[report] Groq failed, using rule-based fallback:", groqErr)
+      report = extractRuleBased(msgs)
+      source = "rule-based"
     }
 
-    /* Step 3 — Bucket entities by report field */
-    const buckets: Record<string, string[]> = {
-      symptoms:       [],
-      diagnosis:      [],
-      medications:    [],
-      investigations: [],
-      examFindings:   [],
-      treatment:      [],
-      additionalNotes:[],
-      bodyParts:      [],  // internal — merged into examFindings
-      dosage:         [],  // internal — merged with medications
-    }
+    return NextResponse.json({ report, source })
 
-    entities.forEach(ent => {
-      if (ent.score < 0.50) return   // low-confidence filter
-
-      const label  = ent.entity_group
-      const word   = ent.word.replace(/^##/, "").trim()
-      const field  = LABEL_MAP[label]
-
-      if (label === "Body_part" || label === "Anatomy" || label === "Biological_structure") {
-        buckets.bodyParts.push(word)
-        return
-      }
-      if (field && buckets[field]) {
-        buckets[field].push(word)
-      }
-    })
-
-    /* Step 4 — Merge medications with dosage/frequency */
-    const mergedMeds = mergeMedications(entities, fullTranscript)
-    if (mergedMeds.length) buckets.medications = mergedMeds
-
-    /* Step 5 — Fill fields NER struggles with using rules */
-    const chiefComplaint   = extractChiefComplaint(patientLines)
-    const followUp         = extractFollowUp(doctorLines)
-    const examFindings     = extractExamFindings(doctorLines, buckets.bodyParts)
-
-    // History = all patient lines joined, trimmed
-    const history = patientLines.join(" ").trim().slice(0, 600) || "Not documented"
-
-    /* Step 6 — Assemble report */
-    const report: MedicalReport = {
-      chiefComplaint,
-      historyOfPresentIllness: history,
-      symptoms:       dedup(buckets.symptoms).length
-                        ? dedup(buckets.symptoms)
-                        : fallbackSymptoms(fullTranscript),
-      examFindings,
-      diagnosis:      dedup(buckets.diagnosis).join("; ") || fallbackDiagnosis(doctorLines),
-      treatment:      dedup(buckets.treatment).length
-                        ? dedup(buckets.treatment)
-                        : fallbackTreatment(doctorLines),
-      medications:    dedup(buckets.medications).length
-                        ? dedup(buckets.medications)
-                        : fallbackMedications(doctorLines),
-      investigations: dedup(buckets.investigations).length
-                        ? dedup(buckets.investigations)
-                        : fallbackInvestigations(fullTranscript),
-      followUp,
-      additionalNotes: dedup(buckets.additionalNotes).join(". ")
-                         || `${department?.replace(/_/g," ")} consultation — ${patientName}, ${patientAge}y${patientGender ? `, ${patientGender}` : ""}`,
-    }
-
-    return NextResponse.json({
-      report,
-      source: entities.length ? "ner" : "rule-based",
-      entityCount: entities.length,
-    })
-
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : "Unknown error"
-    console.error("Report route error:", msg)
-    return NextResponse.json({ error: msg }, { status: 500 })
+  } catch (err) {
+    console.error("[report] error:", err)
+    return NextResponse.json({ error: "Report generation failed", detail: String(err) }, { status: 500 })
   }
-}
-
-/* ─── Keyword fallbacks for when NER finds nothing ─── */
-function fallbackSymptoms(text: string): string[] {
-  const keywords = [
-    "pain","fever","cough","cold","vomiting","nausea","headache","dizziness",
-    "fatigue","weakness","swelling","rash","itching","breathlessness",
-    "chest pain","stomach ache","back pain","sore throat","runny nose",
-    "loose stools","diarrhoea","constipation","loss of appetite","insomnia",
-  ]
-  return keywords.filter(k => text.toLowerCase().includes(k))
-}
-
-function fallbackDiagnosis(doctorLines: string[]): string {
-  const line = doctorLines.find(l =>
-    /diagnos|condition|impression|suffer|you have|it is|this is|presents with/i.test(l)
-  )
-  return line?.slice(0, 150) ?? "Pending evaluation"
-}
-
-function fallbackTreatment(doctorLines: string[]): string[] {
-  return doctorLines
-    .filter(l => /take|rest|avoid|drink|eat|apply|use|stop|start|continue|increase|decrease/i.test(l))
-    .slice(0, 4)
-}
-
-function fallbackMedications(doctorLines: string[]): string[] {
-  return doctorLines
-    .filter(l => /tablet|syrup|capsule|mg|ml|injection|drops|cream|ointment|paracetamol|amoxicillin|ibuprofen|cetirizine|omeprazole|azithromycin|metformin/i.test(l))
-    .slice(0, 5)
-}
-
-function fallbackInvestigations(text: string): string[] {
-  const tests = [
-    "blood test","cbc","complete blood count","urine test","urine culture",
-    "x-ray","xray","mri","ct scan","ultrasound","ecg","echo",
-    "biopsy","culture","hba1c","thyroid","lipid profile","liver function",
-    "kidney function","rbs","fbs","ppbs",
-  ]
-  return tests.filter(t => text.toLowerCase().includes(t))
 }

@@ -110,10 +110,8 @@ function TiltCard({ children, style = {} }: { children: React.ReactNode; style?:
 /* ══════════ LANGUAGE TICKER ══════════ */
 function LangTicker() {
   const items = [
-    "हिन्दी — Hindi", "ಕನ್ನಡ — Kannada", "English",
-    "हिन्दी — Hindi", "ಕನ್ನಡ — Kannada", "English",
-    "हिन्दी — Hindi", "ಕನ್ನಡ — Kannada", "English",
-    "हिन्दी — Hindi", "ಕನ್ನಡ — Kannada", "English",
+    "ಕನ್ನಡ — Kannada", "தமிழ் — Tamil", "తెలుగు — Telugu", "മലയാളം — Malayalam", "हिन्दी — Hindi", "English",
+    "ಕನ್ನಡ — Kannada", "தமிழ் — Tamil", "తెలుగు — Telugu", "മലയാളം — Malayalam", "हिन्दी — Hindi", "English",
   ]
   return (
     <div style={{ overflow: "hidden", borderTop: "1px solid rgba(56,189,248,0.1)", borderBottom: "1px solid rgba(56,189,248,0.1)", padding: "14px 0", position: "relative" }}>
@@ -373,7 +371,7 @@ export default function Home() {
           </h1>
 
           <p style={{ fontFamily: "var(--mono)", fontSize: 12, lineHeight: 2.1, color: "rgba(180,196,220,0.5)", maxWidth: 400, fontWeight: 300, letterSpacing: "0.02em", marginBottom: 40, animation: "fadeUp 0.7s 0.35s ease both", opacity: 0, animationFillMode: "both" }}>
-            AI-powered OPD consultation platform — transcribes Hindi, Kannada &amp; English simultaneously, generates structured medical reports via biomedical NER, and maintains complete patient visit history.
+            AI-powered OPD consultation platform — transcribes Kannada, Tamil, Telugu, Malayalam, Hindi &amp; English simultaneously, generates structured medical reports via biomedical NER, and maintains complete patient visit history.
           </p>
 
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 52, animation: "fadeUp 0.7s 0.45s ease both", opacity: 0, animationFillMode: "both" }}>
@@ -384,7 +382,7 @@ export default function Home() {
           {/* Vital readouts */}
           <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, animation: "fadeUp 0.7s 0.6s ease both", opacity: 0, animationFillMode: "both" }}>
             <VitalMonitor label="Accuracy" value="~95" unit="%" status="ok" />
-            <VitalMonitor label="Languages" value="3" unit="langs" status="ok" />
+            <VitalMonitor label="Languages" value="6" unit="langs" status="ok" />
             <VitalMonitor label="Report" value="<30" unit="sec" status="ok" />
           </div>
         </div>
@@ -421,7 +419,7 @@ export default function Home() {
           </div>
           <div style={{ border: "1px solid rgba(56,189,248,0.08)", borderRadius: 5, overflow: "hidden" }}>
             {[
-              { n: "01", icon: "🎙", title: "Live multilingual transcription", body: "Sarvam saarika:v2.5 captures patient speech in Kannada or Hindi and doctor speech in English simultaneously — transcribed and translated to all three languages in real time, with separate visual panels per speaker.", reversed: false },
+              { n: "01", icon: "🎙", title: "Live multilingual transcription", body: "Sarvam saarika:v2.5 captures patient speech in any South Indian language (Kannada, Tamil, Telugu, Malayalam) or Hindi, and doctor speech in English — transcribed and translated to all 6 languages in real time, with separate visual panels per speaker.", reversed: false },
               { n: "02", icon: "🧬", title: "NER-powered report generation", body: "d4data/biomedical-ner-all extracts symptoms, diagnosis, medications, dosage, investigations, and follow-up instructions from the transcript into a structured SOAP report — no templates, no manual input.", reversed: true },
               { n: "03", icon: "🔊", title: "Text-to-speech in patient's language", body: "Doctor responses are synthesised in the patient's language via Sarvam bulbul:v2. Each message gets independent EN / HI / KN playback buttons — making consultations accessible regardless of literacy level.", reversed: false },
               { n: "04", icon: "✏️", title: "Inline correction with re-translation", body: "Any mistranscribed term can be corrected directly on the bubble. The edit immediately re-translates to all three language versions, keeping the entire record consistent without restarting the session.", reversed: true },
@@ -480,18 +478,21 @@ export default function Home() {
             <div className="section-label" style={{ marginBottom: 18 }}>Language Stack</div>
             <h2 style={{ fontFamily: "var(--serif)", fontSize: "clamp(28px,3.5vw,44px)", fontWeight: 800, letterSpacing: "-0.025em", lineHeight: 1.05, color: "#e8edf5", marginBottom: 20 }}>
               Spoken by<br />
-              <em style={{ color: "#38bdf8" }}>1.4 billion.</em><br />
-              <span style={{ color: "rgba(255,255,255,0.18)" }}>Documented by one.</span>
+              <em style={{ color: "#38bdf8" }}>South India</em><br />
+              <span style={{ color: "rgba(255,255,255,0.18)" }}>Documented in one.</span>
             </h2>
             <p style={{ fontFamily: "var(--mono)", fontSize: 12, lineHeight: 2, color: "rgba(180,196,220,0.45)", maxWidth: 380, fontWeight: 300 }}>
-              India's OPDs see patients speaking dozens of languages — but documentation is expected in English. MediLingua bridges that gap invisibly, reducing miscommunication and improving diagnostic accuracy.
+              South India's OPDs see patients speaking Kannada, Tamil, Telugu, or Malayalam — but documentation is expected in English. MediLingua bridges that gap invisibly across all 6 languages, reducing miscommunication and improving diagnostic accuracy.
             </p>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
             {[
-              { flag: "🇮🇳", name: "Kannada", script: "ಕನ್ನಡ", region: "Karnataka · ~61M speakers", code: "kn-IN", delay: 0 },
-              { flag: "🇮🇳", name: "Hindi", script: "हिन्दी", region: "Pan-India · ~600M speakers", code: "hi-IN", delay: 0.6 },
-              { flag: "🌐", name: "English", script: "Medical standard", region: "Documentation layer", code: "en-IN", delay: 1.2 },
+              { flag: "🇮🇳", name: "Kannada",   script: "ಕನ್ನಡ",    region: "Karnataka · ~61M speakers",      code: "kn-IN", delay: 0   },
+              { flag: "🇮🇳", name: "Tamil",     script: "தமிழ்",   region: "Tamil Nadu · ~75M speakers",     code: "ta-IN", delay: 0.3 },
+              { flag: "🇮🇳", name: "Telugu",    script: "తెలుగు",  region: "Andhra/Telangana · ~80M speakers",code: "te-IN", delay: 0.6 },
+              { flag: "🇮🇳", name: "Malayalam", script: "മലയാളം", region: "Kerala · ~38M speakers",          code: "ml-IN", delay: 0.9 },
+              { flag: "🇮🇳", name: "Hindi",     script: "हिन्दी",  region: "Pan-India · ~600M speakers",     code: "hi-IN", delay: 1.2 },
+              { flag: "🌐", name: "English",    script: "Medical standard", region: "Documentation layer",   code: "en-IN", delay: 1.5 },
             ].map((l, i) => (
               <div key={l.code} className="lang-row" style={{
                 display: "flex", alignItems: "center", gap: 20, padding: "22px 28px",
